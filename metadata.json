@@ -1,0 +1,10 @@
+{
+  "name": "RedSOS Mesh",
+  "description": "Plataforma Inteligente de Comunicación de Emergencias con y sin Internet, con botón de pánico SOS, chat mesh distributivo, ubicación en tiempo real y enrutamiento inteligente.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

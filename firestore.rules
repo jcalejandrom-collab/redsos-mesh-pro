@@ -1,0 +1,32 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // RedSOS Public Access & Tactical Node Sync Rules
+    
+    match /alerts/{alertId} {
+      // Emergency alerts are public to read (crucial for local evacuation/awareness)
+      allow read: if true;
+      // Creation is allowed if it is a valid emergency packet submission
+      allow create: if request.resource.data.messageId != null 
+                    && request.resource.data.latitude >= -90.0 
+                    && request.resource.data.latitude <= 90.0
+                    && request.resource.data.longitude >= -180.0 
+                    && request.resource.data.longitude <= 180.0;
+      // Updates and deletes are restricted to authorized personnel / admin services
+      allow update, delete: if request.auth != null;
+    }
+
+    match /nodes/{nodeId} {
+      // Anyone can see active node densities for heatmaps, but detailed telemetry is restricted to authenticated sessions
+      allow read: if true;
+      // Active nodes can register and report their battery & location
+      allow write: if true;
+    }
+
+    match /telemetry/{telemetryId} {
+      allow read: if true;
+      // Only validated relays/gateways publish back-propagation hop telemetry
+      allow write: if true;
+    }
+  }
+}

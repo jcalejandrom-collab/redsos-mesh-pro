@@ -1,0 +1,57 @@
+{
+  "firestore": {
+    "collections": {
+      "alerts": {
+        "description": "Critical active emergency alerts propagated through the BLE Mesh",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "messageId": { "type": "integer" },
+            "type": { "type": "integer" },
+            "latitude": { "type": "number" },
+            "longitude": { "type": "number" },
+            "battery": { "type": "integer" },
+            "ttl": { "type": "integer" },
+            "flags": { "type": "integer" },
+            "hash": { "type": "integer" },
+            "timestamp": { "type": "string", "format": "date-time" },
+            "status": { "type": "string" },
+            "classification": { "type": "string" },
+            "source": { "type": "string" }
+          },
+          "required": ["messageId", "latitude", "longitude", "battery", "timestamp", "status"]
+        }
+      },
+      "nodes": {
+        "description": "Tactical status of citizen and brigade nodes active in the opportunistic network",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "nodeId": { "type": "string" },
+            "role": { "type": "string" },
+            "battery": { "type": "integer" },
+            "lastLatitude": { "type": "number" },
+            "lastLongitude": { "type": "number" },
+            "lastSeen": { "type": "string", "format": "date-time" },
+            "trustScore": { "type": "number" }
+          },
+          "required": ["nodeId", "role", "lastSeen"]
+        }
+      },
+      "telemetry": {
+        "description": "Network propagation telemetry for hops tracking and Dijkstra estimations",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "messageId": { "type": "integer" },
+            "hopCount": { "type": "integer" },
+            "gatewayNodeId": { "type": "string" },
+            "rssi": { "type": "integer" },
+            "timestamp": { "type": "string", "format": "date-time" }
+          },
+          "required": ["messageId", "hopCount", "timestamp"]
+        }
+      }
+    }
+  }
+}
