@@ -936,20 +936,16 @@ export default function DashboardAdmin() {
                 </span>
               </div>
 
-              {/* Capa 2: LoRa Meshtastic */}
-              <div className={`p-2.5 rounded-lg border ${meshLayerStatus?.loRa.available ? 'bg-emerald-950/20 border-emerald-500/30' : 'bg-slate-950 border-slate-800'} flex justify-between items-center`}>
+              {/* Capa 2: LoRa Meshtastic - sin integración de hardware real todavía */}
+              <div className="p-2.5 rounded-lg border bg-slate-950 border-slate-800 flex justify-between items-center opacity-60">
                 <div className="space-y-0.5">
                   <div className="text-xs font-semibold text-slate-200">Capa 2: LoRa Meshtastic (Canal IAGAMI)</div>
                   <div className="text-[10px] text-slate-400 font-mono">
-                    {meshLayerStatus?.loRa.available 
-                      ? `${meshLayerStatus.loRa.nodesNearby} nodos activos (${(meshLayerStatus.loRa.nodesNearby * 1.5).toFixed(1)} km² cobertura)` 
-                      : 'Buscando nodos de radio en 915MHz...'}
+                    Pendiente de integración de hardware físico (radios LoRa/Meshtastic)
                   </div>
                 </div>
-                <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
-                  meshLayerStatus?.loRa.available ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400 border border-slate-700'
-                }`}>
-                  {meshLayerStatus?.loRa.available ? 'ACTIVO' : 'SENSING'}
+                <span className="px-2 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-800 text-slate-400 border border-slate-700">
+                  NO DISPONIBLE
                 </span>
               </div>
 
@@ -958,15 +954,15 @@ export default function DashboardAdmin() {
                 <div className="space-y-0.5">
                   <div className="text-xs font-semibold text-slate-200">Capa 3: BLE Nativo (Brigadas de Rescate)</div>
                   <div className="text-[10px] text-slate-400 font-mono">
-                    {meshLayerStatus?.nativeBLE.peersConnected 
-                      ? `${meshLayerStatus.nativeBLE.peersConnected} rescatistas de IAGAMI enlazados` 
-                      : 'Buscando pasarela nativa...'}
+                    {meshLayerStatus?.nativeBLE.available
+                      ? 'Advertising activo (sin confirmación de recepción — BLE no tiene ACK)'
+                      : 'No disponible en este navegador/plataforma'}
                   </div>
                 </div>
                 <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
                   meshLayerStatus?.nativeBLE.available ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400 border border-slate-700'
                 }`}>
-                  {meshLayerStatus?.nativeBLE.available ? 'CONECTADO' : 'SENSING'}
+                  {meshLayerStatus?.nativeBLE.available ? 'DISPONIBLE' : 'NO DISPONIBLE'}
                 </span>
               </div>
 

@@ -1,30 +1,27 @@
 /**
  * RedSOS - Integrador: MeshOrchestrator.ts
- * Coordina las 4 capacidades offline automáticamente eligiendo el mejor canal disponible.
+ * Coordina las capacidades offline automáticamente eligiendo el mejor canal disponible.
  * Incluye detector sísmico simulado, linterna morse, mapa offline y envío paralelo en modo SEVERO.
+ *
+ * NOTA DE SEGURIDAD: los canales LoRa/Meshtastic (MeshtasticBridgeService.ts) y WiFi Direct
+ * (WiFiDirectService.ts) NO están integrados a hardware real todavía — ambos servicios simulan
+ * su comportamiento internamente. Por eso quedan deliberadamente fuera de la cadena de failover
+ * de sendSOSOptimal()/startMeshMonitor(): incluirlos generaría falsos positivos de envío durante
+ * una emergencia real sin internet. El código de ambos servicios permanece en el repo como
+ * trabajo futuro, pero no debe invocarse desde este orquestador hasta tener integración real.
  */
 
 import { Capacitor } from '@capacitor/core';
 import * as CapacitorBLE from './CapacitorBLEService';
 import { loadPrivateKey, signPacket, hashPacket } from './CryptoService';
 
-import { 
-  MeshPacket, 
-  broadcastSOS, 
-  cachePacketLocally, 
-  getMeshStatus, 
-  syncCachedPackets 
-} from './BluetoothMeshService';
-import { 
-  sendSOSviaLoRa, 
-  getNearbyMeshtasticNodes 
-} from './MeshtasticBridgeService';
 import {
-  startWiFiDirectGroup,
-  broadcastViaWiFiDirect,
-  getConnectedPeers,
-  listenWiFiDirect
-} from './WiFiDirectService';
+  MeshPacket,
+  broadcastSOS,
+  cachePacketLocally,
+  getMeshStatus,
+  syncCachedPackets
+} from './BluetoothMeshService';
 import {
   startSOSFlash,
   getFlashStatus,
@@ -121,23 +118,26 @@ export function clearSeismicSimulation(): void {
 
 /**
  * Coordina y envía una alerta SOS seleccionando el canal óptimo según la disponibilidad real
- * Jerarquía de envío estándar:
+ * Jerarquía de envío estándar (solo canales con integración de hardware/red real):
  * 1. Internet disponible → Cloudflare Worker (menor latencia)
- * 2. LoRa disponible → Meshtastic (mayor alcance, 15km)
- * 3. WiFi Direct → WebSocket local (200m) - NUEVO
- * 4. Native BLE disponible → CapacitorBLEService (brigadas, 100m)
- * 5. Web Bluetooth disponible → BluetoothMeshService (civiles, 30m)
- * 6. Todo falla → cachePacketLocally() y esperar handshake
- * 
+ * 2. Native BLE disponible → CapacitorBLEService (brigadas, 100m)
+ * 3. Web Bluetooth disponible → BluetoothMeshService (civiles, 30m)
+ * 4. Todo falla → cachePacketLocally() y esperar handshake
+ *
+ * LoRa/Meshtastic y WiFi Direct quedan fuera de esta cadena hasta tener integración de
+ * hardware real (ver nota de seguridad al inicio del archivo).
+ *
  * Si la intensidad sísmica es SEVERO:
- * - Activar TODAS las capas simultáneamente en paralelo (usando Promise.allSettled)
+ * - Activar TODAS las capas reales simultáneamente en paralelo (usando Promise.allSettled)
  * - Iniciar flashMorse('SOS') automáticamente
  * - Cambiar mapa a vista de alertas activas
  */
 export async function sendSOSOptimal(packet: MeshPacket): Promise<{
-  sentVia: 'WEB_BLUETOOTH' | 'NATIVE_BLE' | 'LORA' | 'WIFI_DIRECT' | 'INTERNET' | 'CACHED' | 'PARALELO_SEVERO';
+  sentVia: 'WEB_BLUETOOTH' | 'NATIVE_BLE' | 'INTERNET' | 'CACHED' | 'PARALELO_SEVERO';
   peersReached: number;
   estimatedRangeMeters: number;
+  confirmationAvailable: boolean;
+  note?: string;
 }> {
   console.log(`[Orquestador Mesh] Evaluando canal óptimo para paquete SOS ${packet.uuid}`);
 
@@ -194,29 +194,15 @@ export async function sendSOSOptimal(packet: MeshPacket): Promise<{
         }
         throw new Error("Sin conexión a Internet");
       })(),
-      
-      // Capa 2: LoRa Meshtastic
-      (async () => {
-        await sendSOSviaLoRa(packet);
-        return 'LORA';
-      })(),
 
-      // Capa 3: WiFi Direct
-      (async () => {
-        // Asegurar que el grupo esté listo para transmitir
-        await startWiFiDirectGroup();
-        await broadcastViaWiFiDirect(packet);
-        return 'WIFI_DIRECT';
-      })(),
-
-      // Capa 4: Native BLE
+      // Capa 2: Native BLE
       (async () => {
         await CapacitorBLE.initNativeBLE();
         await CapacitorBLE.broadcastSOS(packet);
         return 'NATIVE_BLE';
       })(),
 
-      // Capa 5: Web Bluetooth BLE
+      // Capa 3: Web Bluetooth BLE
       (async () => {
         await broadcastSOS(packet);
         return 'WEB_BLUETOOTH';
@@ -224,26 +210,24 @@ export async function sendSOSOptimal(packet: MeshPacket): Promise<{
     ];
 
     const results = await Promise.allSettled(transmissions);
-    
+
+    // Solo contamos peers de canales con confirmación real de entrega:
+    // Internet (respuesta HTTP 2xx del Worker) y Web Bluetooth (conexiones GATT activas y trackeadas).
+    // Native BLE (advertising) no tiene ACK, así que no suma a peersCount aquí.
     let peersCount = 0;
     let maxRange = 0;
+    let bleSentWithoutConfirmation = false;
     results.forEach((res, index) => {
       if (res.status === 'fulfilled') {
         console.log(`[Orquestador] Canal [${index + 1}] enviado con éxito: ${res.value}`);
         if (index === 0) { // Internet
           peersCount += 1;
           maxRange = Math.max(maxRange, 99999);
-        } else if (index === 1) { // LoRa
-          peersCount += 5; // Estimación promedio LoRa
-          maxRange = Math.max(maxRange, 15000);
-        } else if (index === 2) { // WiFi Direct
-          peersCount += 3;
-          maxRange = Math.max(maxRange, 200);
-        } else if (index === 3) { // Native BLE
-          peersCount += 2;
+        } else if (index === 1) { // Native BLE - sin ACK, no se cuenta como peer confirmado
+          bleSentWithoutConfirmation = true;
           maxRange = Math.max(maxRange, 100);
-        } else if (index === 4) { // Web Bluetooth
-          peersCount += 2;
+        } else if (index === 2) { // Web Bluetooth
+          peersCount += getMeshStatus().connectedPeers;
           maxRange = Math.max(maxRange, 30);
         }
       } else {
@@ -258,14 +242,19 @@ export async function sendSOSOptimal(packet: MeshPacket): Promise<{
       return {
         sentVia: 'CACHED',
         peersReached: 0,
-        estimatedRangeMeters: 0
+        estimatedRangeMeters: 0,
+        confirmationAvailable: false
       };
     }
 
     return {
       sentVia: 'PARALELO_SEVERO',
-      peersReached: peersCount || 3,
-      estimatedRangeMeters: maxRange || 15000
+      peersReached: peersCount,
+      estimatedRangeMeters: maxRange,
+      confirmationAvailable: peersCount > 0,
+      note: bleSentWithoutConfirmation
+        ? 'Incluye transmisión por Bluetooth nativo (confirmación de recepción no disponible).'
+        : undefined
     };
   }
 
@@ -296,84 +285,58 @@ export async function sendSOSOptimal(packet: MeshPacket): Promise<{
         return {
           sentVia: 'INTERNET',
           peersReached: 1,
-          estimatedRangeMeters: 99999
+          estimatedRangeMeters: 99999,
+          confirmationAvailable: true
         };
       }
     } catch (e) {
-      console.warn("[Orquestador] Fallo en Canal 1 (Internet), recurriendo a Canal 2 (LoRa)...", e);
+      console.warn("[Orquestador] Fallo en Canal 1 (Internet), recurriendo a Canal 2 (Native BLE)...", e);
     }
   }
 
-  // 2. LoRa disponible -> Meshtastic (Largo alcance, 15 km)
+  // 2. Native BLE disponible -> CapacitorBLE
+  // Nota: BLE advertising no tiene ACK — no hay forma de confirmar cuántos dispositivos
+  // realmente recibieron el paquete, así que no inventamos una cifra.
   try {
-    const loraNodes = await getNearbyMeshtasticNodes(10);
-    if (loraNodes.length > 0) {
-      console.log(`[Orquestador] Canal 2: LORA (Meshtastic) seleccionado. Nodos cercanos: ${loraNodes.length}`);
-      await sendSOSviaLoRa(packet);
-      return {
-        sentVia: 'LORA',
-        peersReached: loraNodes.length,
-        estimatedRangeMeters: 15000
-      };
-    }
-  } catch (e) {
-    console.warn("[Orquestador] Error en Canal 2 (LoRa), recurriendo a Canal 3 (WiFi Direct)...", e);
-  }
-
-  // 3. WiFi Direct -> WebSocket local (alcance 200m)
-  try {
-    console.log("[Orquestador] Canal 3: WIFI DIRECT seleccionado. Levantando grupo...");
-    const groupInfo = await startWiFiDirectGroup();
-    if (groupInfo) {
-      await broadcastViaWiFiDirect(packet);
-      const peers = await getConnectedPeers();
-      return {
-        sentVia: 'WIFI_DIRECT',
-        peersReached: peers.length || 3,
-        estimatedRangeMeters: 200
-      };
-    }
-  } catch (e) {
-    console.warn("[Orquestador] Error en Canal 3 (WiFi Direct), recurriendo a Canal 4 (Native BLE)...", e);
-  }
-
-  // 4. Native BLE disponible -> CapacitorBLE
-  try {
-    console.log("[Orquestador] Canal 4: Capacitor BLE seleccionado. Emitiendo...");
+    console.log("[Orquestador] Canal 2: Capacitor BLE seleccionado. Emitiendo...");
     await CapacitorBLE.initNativeBLE();
     await CapacitorBLE.broadcastSOS(packet);
     return {
       sentVia: 'NATIVE_BLE',
-      peersReached: 3,
-      estimatedRangeMeters: CapacitorBLE.rssiToMeters(-65)
+      peersReached: 0,
+      estimatedRangeMeters: CapacitorBLE.rssiToMeters(-65),
+      confirmationAvailable: false,
+      note: 'Paquete transmitido por Bluetooth (confirmación de recepción no disponible).'
     };
   } catch (e) {
-    console.warn("[Orquestador] Error en Canal 4 (Native BLE), recurriendo a Canal 5 (Web Bluetooth)...", e);
+    console.warn("[Orquestador] Error en Canal 2 (Native BLE), recurriendo a Canal 3 (Web Bluetooth)...", e);
   }
 
-  // 5. Web Bluetooth disponible -> BluetoothMeshService (Civiles, 30m)
+  // 3. Web Bluetooth disponible -> BluetoothMeshService (Civiles, 30m)
   try {
     const webBtStatus = getMeshStatus();
     if (webBtStatus.isScanning) {
-      console.log("[Orquestador] Canal 5: WEB_BLUETOOTH seleccionado. Propagando...");
+      console.log("[Orquestador] Canal 3: WEB_BLUETOOTH seleccionado. Propagando...");
       await broadcastSOS(packet);
       return {
         sentVia: 'WEB_BLUETOOTH',
         peersReached: webBtStatus.connectedPeers,
-        estimatedRangeMeters: 30
+        estimatedRangeMeters: 30,
+        confirmationAvailable: webBtStatus.connectedPeers > 0
       };
     }
   } catch (e) {
-    console.warn("[Orquestador] Error en Canal 5 (Web Bluetooth)...", e);
+    console.warn("[Orquestador] Error en Canal 3 (Web Bluetooth)...", e);
   }
 
-  // 6. Todo falla -> Guardar localmente en caché offline
+  // 4. Todo falla -> Guardar localmente en caché offline
   console.log("[Orquestador] No hay canales activos viables. Guardando en cola local offline...");
   cachePacketLocally(packet);
   return {
     sentVia: 'CACHED',
     peersReached: 0,
-    estimatedRangeMeters: 0
+    estimatedRangeMeters: 0,
+    confirmationAvailable: false
   };
 }
 
@@ -385,16 +348,11 @@ export function startMeshMonitor(
 ): void {
   const checkStatus = async () => {
     const internet = typeof navigator !== 'undefined' ? navigator.onLine : false;
-    
-    let loraNodesCount = 0;
-    try {
-      const nodes = await getNearbyMeshtasticNodes(10);
-      loraNodesCount = nodes.length;
-    } catch (e) {}
 
     const webBt = getMeshStatus();
     const flashStatus = getFlashStatus();
-    
+    const isNative = Capacitor.isNativePlatform();
+
     let mapTilesCount = 0;
     let tilesAvailable = false;
     try {
@@ -403,22 +361,11 @@ export function startMeshMonitor(
       tilesAvailable = stats.available;
     } catch (e) {}
 
-    // WiFi Direct status
-    let wifiDirectPeersCount = 0;
-    try {
-      const peers = await getConnectedPeers();
-      wifiDirectPeersCount = peers.length;
-    } catch (e) {}
-
-    // Determinar el canal óptimo actual
+    // Determinar el canal óptimo actual (solo canales con integración real)
     let optimalChannel = 'WEB_BLUETOOTH';
     if (internet) {
       optimalChannel = 'INTERNET (GLOBAL)';
-    } else if (loraNodesCount > 0) {
-      optimalChannel = 'LORA (MESHTASTIC)';
-    } else if (wifiDirectPeersCount > 0) {
-      optimalChannel = 'WIFI DIRECT (P2P)';
-    } else if (webBt.connectedPeers > 0) {
+    } else if (isNative) {
       optimalChannel = 'NATIVE BLE (BRIGADAS)';
     } else if (webBt.isScanning) {
       optimalChannel = 'WEB BLUETOOTH (CIVILES)';
@@ -428,14 +375,12 @@ export function startMeshMonitor(
 
     onStatusChange({
       internet,
-      loRa: { available: loraNodesCount > 0, nodesNearby: loraNodesCount },
-      nativeBLE: { available: true, peersConnected: 3 },
+      // LoRa y WiFi Direct sin integración de hardware real: siempre "no disponible"
+      // hasta que MeshtasticBridgeService.ts / WiFiDirectService.ts se conecten a radios reales.
+      loRa: { available: false, nodesNearby: 0 },
+      nativeBLE: { available: isNative, peersConnected: 0 },
       webBluetooth: { available: webBt.isScanning, peersConnected: webBt.connectedPeers },
-      wifiDirect: { 
-        available: wifiDirectPeersCount > 0, 
-        peersConnected: wifiDirectPeersCount, 
-        throughputKBps: wifiDirectPeersCount > 0 ? 350 : 0 
-      },
+      wifiDirect: { available: false, peersConnected: 0, throughputKBps: 0 },
       cachedPackets: webBt.cachedPackets,
       optimalChannel,
       seismicDetector: { active: isSeismicActive, lastEvent: lastSeismicEvent },
@@ -443,13 +388,6 @@ export function startMeshMonitor(
       offlineMap: { tilesAvailable, tileCount: mapTilesCount }
     });
   };
-
-  // Escuchar por WiFi Direct y vincularlo
-  try {
-    listenWiFiDirect((p) => {
-      console.log("[Orquestador Monitor] Captado paquete vía WiFi Direct:", p.uuid);
-    }).catch(() => {});
-  } catch (e) {}
 
   // Ejecutar inmediatamente
   checkStatus();

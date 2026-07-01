@@ -170,8 +170,10 @@ export default function PanicPanel({
 
     let sentVia: string = '';
     let success = false;
-    let peersReached = 1;
-    let rangeMeters = 150;
+    let peersReached = 0;
+    let rangeMeters = 0;
+    let confirmationAvailable = false;
+    let confirmationNote: string | undefined;
 
     // 2. Intenta enviar al Worker: POST ${API_URL}/api/alerts
     try {
@@ -193,17 +195,17 @@ export default function PanicPanel({
       });
 
       if (res.ok) {
-        const data = await res.json();
         success = true;
         sentVia = 'INTERNET';
-        peersReached = data.peersReached || 10;
-        rangeMeters = 5000;
+        // El Worker confirma persistencia del registro; no reporta cuántos nodos mesh lo verán.
+        peersReached = 1;
+        confirmationAvailable = true;
       } else {
         throw new Error("Servidor retornó código " + res.status);
       }
     } catch (err: any) {
       console.warn("Fallo canal Internet, intentando vía MeshOrchestrator Bluetooth...", err);
-      
+
       // 3. Si falla → intenta por Bluetooth via MeshOrchestrator
       try {
         setBannerMessage("Internet Offline. Iniciando transmisión de radio Bluetooth local...");
@@ -213,6 +215,8 @@ export default function PanicPanel({
           sentVia = result.sentVia;
           peersReached = result.peersReached;
           rangeMeters = result.estimatedRangeMeters;
+          confirmationAvailable = result.confirmationAvailable;
+          confirmationNote = result.note;
         } else {
           success = false;
           sentVia = 'CACHED';
@@ -227,7 +231,17 @@ export default function PanicPanel({
     // 4. Muestra estado: QUEUED → CONFIRMED o FAILED
     if (success) {
       setSosState('CONFIRMED');
-      setBannerMessage(`SOS enviado vía ${sentVia} — ${peersReached} nodos alcanzados en un radio de ~${rangeMeters}m`);
+      if (confirmationAvailable) {
+        setBannerMessage(
+          sentVia === 'INTERNET'
+            ? 'SOS enviado vía INTERNET — recepción confirmada por el Centro de Mando'
+            : `SOS enviado vía ${sentVia} — ${peersReached} nodos alcanzados en un radio de ~${rangeMeters}m`
+        );
+      } else {
+        setBannerMessage(
+          `SOS transmitido vía ${sentVia} — confirmación de recepción no disponible${confirmationNote ? ` (${confirmationNote})` : ''}`
+        );
+      }
       
       // 5. En CONFIRMED: vibra el celular
       if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
