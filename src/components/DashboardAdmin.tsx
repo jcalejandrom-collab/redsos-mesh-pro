@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { 
   Shield, 
   Lock, 
@@ -18,10 +19,25 @@ import {
   Eye,
   Sliders,
   Sparkles,
-  Navigation
+  Navigation,
+  FileSpreadsheet,
+  Download,
+  Database,
+  CloudLightning,
+  LogOut,
+  MessageSquare,
+  ShieldAlert
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import NetworkMap from './NetworkMap';
+import { initAuth, googleSignIn, logout } from '../utils/firebase';
+import { createRedSOSSpreadsheet, appendAlertsToSheet, SheetsAlertRow } from '../utils/googleSheets';
+import { sendCriticalAlert, getCircuitBreakerStatus, resetCircuitBreaker } from '../services/ChatNotificationService';
+import { startMeshMonitor, MeshLayerStatus } from '../services/MeshOrchestrator';
+import { hashAdminToken } from '../services/CryptoService';
+
+import { API_URL, WORKER_URL } from '../config';
+
 
 interface FailedPacket {
   id: string;
@@ -112,6 +128,10 @@ export default function DashboardAdmin() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [updatingNodeId, setUpdatingNodeId] = useState<string | null>(null);
 
+  // Form notifications for adding nodes
+  const [addNodeSuccess, setAddNodeSuccess] = useState<string | null>(null);
+  const [addNodeError, setAddNodeError] = useState<string | null>(null);
+
   // Map & Dijkstra Router states
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [userLat, setUserLat] = useState<number>(10.0735);
@@ -121,26 +141,283 @@ export default function DashboardAdmin() {
   const [calculatedRoute, setCalculatedRoute] = useState<any | null>(null);
   const [dijkstraError, setDijkstraError] = useState<string | null>(null);
 
-  // Check storage on mount
+  // Google Sheets state
+  const [sheetsUser, setSheetsUser] = useState<any | null>(null);
+  const [sheetsToken, setSheetsToken] = useState<string | null>(null);
+  const [spreadsheetId, setSpreadsheetId] = useState<string>(localStorage.getItem('redsos_spreadsheet_id') || '');
+  const [isExportingSheets, setIsExportingSheets] = useState<boolean>(false);
+  const [sheetsStatus, setSheetsStatus] = useState<string>('');
+  const [sheetsSuccess, setSheetsSuccess] = useState<boolean | null>(null);
+  const [sheetsError, setSheetsError] = useState<string | null>(null);
+
+  // Google Chat state complying strictly with Prompt 2
+  const [webhookUrl, setWebhookUrl] = useState<string>(() =>
+    localStorage.getItem('redsos_webhook_url') ?? ''
+  );
+  const [cbStatus, setCbStatus] = useState<{
+    state: 'OPEN' | 'CLOSED';
+    requestCount: number;
+    nextResetIn: number;
+    suppressedCount?: number;
+  } | null>(null);
+  const [chatStatus, setChatStatus] = useState<string>('');
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [isTestingChat, setIsTestingChat] = useState<boolean>(false);
+
+  // Auto-refresh states (Prompt 1)
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [refreshInterval, setRefreshInterval] = useState(10); // segundos
+
+  // Packet loss history state (Prompt 2)
+  const [packetLossHistory, setPacketLossHistory] = useState<{ time: string; loss: number }[]>([]);
+
+  // Latency / Ping states (Prompt 3)
+  const [pingMs, setPingMs] = useState<number | null>(null);
+  const [pingStatus, setPingStatus] = useState<'ok' | 'slow' | 'offline'>('ok');
+
+  // Mesh layers real-time status (Estado de la Red Mesh por Capas)
+  const [meshLayerStatus, setMeshLayerStatus] = useState<MeshLayerStatus | null>(null);
+
+  // Update circuit metrics periodically from getCircuitBreakerStatus
   useEffect(() => {
-    const savedToken = sessionStorage.getItem('redsos_admin_token');
-    if (savedToken) {
-      setAdminToken(savedToken);
-      setIsAuthenticated(true);
-      fetchAdminData(savedToken);
-    }
+    const updateCB = () => {
+      const status = getCircuitBreakerStatus();
+      setCbStatus({
+        state: status.state,
+        requestCount: status.requestCount,
+        nextResetIn: status.nextResetIn,
+        suppressedCount: status.suppressedCount,
+      });
+    };
+    updateCB();
+    const interval = setInterval(updateCB, 1000);
+    return () => clearInterval(interval);
   }, []);
 
-  // Auto-refresh telemetries every 5 seconds when authenticated
+  const handleSaveWebhook = () => {
+    localStorage.setItem('redsos_webhook_url', webhookUrl);
+    setChatStatus("Enlace guardado de forma segura en almacenamiento persistente.");
+    setTimeout(() => setChatStatus(''), 4000);
+  };
+
+  const handleTestChatNotification = async () => {
+    if (!webhookUrl.trim()) {
+      setChatError("Por favor, ingrese un Webhook URL válido.");
+      return;
+    }
+    
+    setIsTestingChat(true);
+    setChatError(null);
+    setChatStatus("Enviando tarjeta de prueba crítica a Google Chat...");
+
+    try {
+      localStorage.setItem('redsos_webhook_url', webhookUrl);
+      const res = await sendCriticalAlert({
+        id: `TEST-${Math.floor(Math.random() * 9000 + 1000)}`,
+        nodeId: "Simulador de Pruebas IAGAMI",
+        lat: 10.0735,
+        lng: -69.3250,
+        batteryLevel: 87,
+        description: "PRUEBA DE INTEGRACIÓN: Webhook disparado desde la Base de Mando Administrativa.",
+        priority: "CRITICAL",
+        timestamp: new Date().toISOString()
+      }, webhookUrl);
+
+      if (res.sent) {
+        setChatStatus("¡Éxito! Tarjeta Rich Card enviada al canal de Google Chat.");
+      } else {
+        if (res.reason === 'CIRCUIT_OPEN' || res.reason === 'CIRCUIT_TRIPPED_TO_OPEN') {
+          throw new Error("El Circuit Breaker está ABIERTO debido a saturación de llamadas. Bloqueando envío por 30s.");
+        } else {
+          throw new Error(`El webhook de Google Chat rechazó la solicitud o el formato es incorrecto: ${res.reason}`);
+        }
+      }
+    } catch (err: any) {
+      setChatError(err.message || "Error al conectar con la API.");
+      setChatStatus("");
+    } finally {
+      setIsTestingChat(false);
+      // Force refresh status
+      const status = getCircuitBreakerStatus();
+      setCbStatus({
+        state: status.state,
+        requestCount: status.requestCount,
+        nextResetIn: status.nextResetIn,
+        suppressedCount: status.suppressedCount,
+      });
+    }
+  };
+
+  const handleResetCircuit = () => {
+    resetCircuitBreaker();
+    const status = getCircuitBreakerStatus();
+    setCbStatus({
+      state: status.state,
+      requestCount: status.requestCount,
+      nextResetIn: status.nextResetIn,
+      suppressedCount: status.suppressedCount,
+    });
+    setChatStatus("Circuit Breaker rearmado con éxito.");
+    setTimeout(() => setChatStatus(''), 4000);
+  };
+
+  // Initialize Google Auth state listener when admin is logged in
   useEffect(() => {
-    if (!isAuthenticated || !adminToken) return;
+    if (!isAuthenticated) return;
+    
+    const unsubscribe = initAuth(
+      (user, token) => {
+        setSheetsUser(user);
+        setSheetsToken(token);
+        setSheetsError(null);
+      },
+      () => {
+        setSheetsUser(null);
+        setSheetsToken(null);
+      }
+    );
+    return () => unsubscribe();
+  }, [isAuthenticated]);
 
-    const interval = setInterval(() => {
-      fetchAdminDataQuietly(adminToken);
-    }, 5000);
+  const handleGoogleSignIn = async () => {
+    setSheetsError(null);
+    setSheetsStatus("Conectando con Google...");
+    try {
+      const res = await googleSignIn();
+      if (res) {
+        setSheetsUser(res.user);
+        setSheetsToken(res.accessToken);
+        setSheetsStatus("Autenticado con éxito");
+      }
+    } catch (err: any) {
+      console.error("Error de login en Sheets:", err);
+      setSheetsError(`Fallo al autenticar: ${err.message || err}`);
+      setSheetsStatus("");
+    }
+  };
 
-    return () => clearInterval(interval);
-  }, [isAuthenticated, adminToken]);
+  const handleGoogleLogout = async () => {
+    try {
+      await logout();
+      setSheetsUser(null);
+      setSheetsToken(null);
+      setSheetsStatus("Sesión de Google cerrada");
+    } catch (err: any) {
+      console.error(err);
+    }
+  };
+
+  const exportToGoogleSheets = async () => {
+    if (!sheetsToken) {
+      setSheetsError("Inicie sesión con su cuenta de Google institucional.");
+      return;
+    }
+
+    // Check internet connection
+    if (navigator.onLine === false) {
+      setSheetsError("Sin conexión a Internet. La exportación de auditoría requiere señal activa.");
+      return;
+    }
+
+    setIsExportingSheets(true);
+    setSheetsStatus("Validando hoja de cálculo...");
+    setSheetsError(null);
+    setSheetsSuccess(null);
+
+    try {
+      let currentSpreadsheetId = spreadsheetId.trim();
+
+      // If no spreadsheet ID exists, create a new one automatically
+      if (!currentSpreadsheetId) {
+        setSheetsStatus("Creando nueva hoja de cálculo 'RedSOS Emergency Audit Log'...");
+        const newId = await createRedSOSSpreadsheet(sheetsToken, `RedSOS Registro de Emergencias - ${new Date().toLocaleDateString()}`);
+        currentSpreadsheetId = newId;
+        setSpreadsheetId(newId);
+        localStorage.setItem('redsos_spreadsheet_id', newId);
+      }
+
+      // Prepare data collection from Firestore alerts
+      setSheetsStatus("Extrayendo datos de alertas...");
+      const alertsToExport = healthData?.emergencyAlerts || [];
+      if (alertsToExport.length === 0) {
+        throw new Error("No hay registros de alerta SOS en cola de datos.");
+      }
+
+      // Map to correct format: 'Timestamp', 'MessageID', 'Latitud', 'Longitud', 'Batería_Nodo' y 'Estado'
+      // Pack the rows with batch optimization to avoid API congestion
+      setSheetsStatus(`Escribiendo lote de ${alertsToExport.length} alertas en bloque...`);
+      const formattedRows: SheetsAlertRow[] = alertsToExport.map((alert: any) => ({
+        timestamp: new Date(alert.created_at).toISOString(),
+        messageId: alert.id || "N/A",
+        latitude: alert.latitude,
+        longitude: alert.longitude,
+        batteryLevel: alert.battery_level || 100,
+        status: alert.status || "active",
+      }));
+
+      // Push to sheets
+      await appendAlertsToSheet(sheetsToken, currentSpreadsheetId, formattedRows);
+
+      setSheetsSuccess(true);
+      setSheetsStatus(`Sincronización finalizada. ${alertsToExport.length} alertas registradas con éxito.`);
+    } catch (err: any) {
+      console.error("Sheets export error:", err);
+      setSheetsError(err.message || "Error al escribir a la API de Google Sheets.");
+      setSheetsSuccess(false);
+    } finally {
+      setIsExportingSheets(false);
+    }
+  };
+
+
+  // Check storage on mount
+  useEffect(() => {
+    // Por seguridad, ya no almacenamos el token en texto plano en sessionStorage.
+    // El usuario de la Base de Mando debe autenticarse al refrescar la página.
+  }, []);
+
+  // 2. useEffect que activa/desactiva el polling (Prompt 1)
+  useEffect(() => {
+    if (!autoRefresh || !isAuthenticated || !adminToken) return;
+    const id = setInterval(() => fetchAdminData(adminToken), refreshInterval * 1000);
+    return () => clearInterval(id);
+  }, [autoRefresh, refreshInterval, isAuthenticated, adminToken]);
+
+  // 2. Función de ping (Prompt 3)
+  const measurePing = async () => {
+    const start = performance.now();
+    try {
+      await fetch(`${API_URL}/api/health`, { cache: 'no-store' });
+      const ms = Math.round(performance.now() - start);
+      setPingMs(ms);
+      setPingStatus(ms < 100 ? 'ok' : ms < 300 ? 'slow' : 'offline');
+    } catch {
+      setPingMs(null);
+      setPingStatus('offline');
+    }
+  };
+
+  // 3. Ejecutar cada 15 segundos cuando autenticado (Prompt 3)
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    measurePing();
+    const id = setInterval(measurePing, 15000);
+    return () => clearInterval(id);
+  }, [isAuthenticated]);
+
+  // Monitor de Capas de Red Mesh por Capas
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let active = true;
+    startMeshMonitor((status) => {
+      if (active) {
+        setMeshLayerStatus(status);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [isAuthenticated]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -151,18 +428,28 @@ export default function DashboardAdmin() {
 
     try {
       // Test the token against backend system-health
-      const res = await fetch('/api/admin/system-health', {
+      const res = await fetch(`${API_URL}/api/admin/system-health`, {
         headers: {
           'x-admin-token': inputToken.trim()
         }
       });
 
       if (res.ok) {
-        sessionStorage.setItem('redsos_admin_token', inputToken.trim());
+        const tokenHash = await hashAdminToken(inputToken.trim());
+        sessionStorage.setItem('redsos_admin_token_hash', tokenHash);
         setAdminToken(inputToken.trim());
         setIsAuthenticated(true);
         const data = await res.json();
         setHealthData(data);
+        if (data?.packetLoss) {
+          setPacketLossHistory(prev => [
+            ...prev.slice(-20),
+            {
+              time: new Date().toLocaleTimeString(),
+              loss: data.packetLoss.averageLoss
+            }
+          ]);
+        }
         setNodeRange(data.globalNodeRange || 150);
         // Also fetch audited chats and current nodes
         await Promise.all([
@@ -181,22 +468,35 @@ export default function DashboardAdmin() {
   };
 
   const handleLogout = () => {
-    sessionStorage.removeItem('redsos_admin_token');
+    sessionStorage.removeItem('redsos_admin_token_hash');
     setAdminToken('');
     setIsAuthenticated(false);
     setHealthData(null);
     setAuditedMsgs([]);
+    setAutoRefresh(false);
+    setPacketLossHistory([]);
+    setPingMs(null);
+    setPingStatus('offline');
   };
 
   const fetchAdminData = async (token: string) => {
     setLoading(true);
     try {
-      const res = await fetch('/api/admin/system-health', {
+      const res = await fetch(`${API_URL}/api/admin/system-health`, {
         headers: { 'x-admin-token': token }
       });
       if (res.ok) {
         const data = await res.json();
         setHealthData(data);
+        if (data?.packetLoss) {
+          setPacketLossHistory(prev => [
+            ...prev.slice(-20),
+            {
+              time: new Date().toLocaleTimeString(),
+              loss: data.packetLoss.averageLoss
+            }
+          ]);
+        }
         setNodeRange(data.globalNodeRange || 150);
         await Promise.all([
           fetchAuditedChats(token),
@@ -214,12 +514,21 @@ export default function DashboardAdmin() {
 
   const fetchAdminDataQuietly = async (token: string) => {
     try {
-      const res = await fetch('/api/admin/system-health', {
+      const res = await fetch(`${API_URL}/api/admin/system-health`, {
         headers: { 'x-admin-token': token }
       });
       if (res.ok) {
         const data = await res.json();
         setHealthData(data);
+        if (data?.packetLoss) {
+          setPacketLossHistory(prev => [
+            ...prev.slice(-20),
+            {
+              time: new Date().toLocaleTimeString(),
+              loss: data.packetLoss.averageLoss
+            }
+          ]);
+        }
         await Promise.all([
           fetchAuditedChats(token),
           fetchNodes()
@@ -232,7 +541,7 @@ export default function DashboardAdmin() {
 
   const handleUpdateAlertStatus = async (alertId: string, newStatus: string) => {
     try {
-      const res = await fetch('/api/alerts/status', {
+      const res = await fetch(`${API_URL}/api/alerts/status`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -252,7 +561,7 @@ export default function DashboardAdmin() {
     setDijkstraError(null);
     setCalculatedRoute(null);
     try {
-      const res = await fetch('/api/admin/dijkstra-route', {
+      const res = await fetch(`${API_URL}/api/admin/dijkstra-route`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -273,7 +582,7 @@ export default function DashboardAdmin() {
 
   const fetchAuditedChats = async (token: string) => {
     try {
-      const res = await fetch('/api/admin/audit-chat', {
+      const res = await fetch(`${API_URL}/api/admin/audit-chat`, {
         headers: { 'x-admin-token': token }
       });
       if (res.ok) {
@@ -287,7 +596,7 @@ export default function DashboardAdmin() {
 
   const fetchNodes = async () => {
     try {
-      const res = await fetch('/api/nodes');
+      const res = await fetch(`${API_URL}/api/nodes`);
       if (res.ok) {
         const data = await res.json();
         setNodes(data);
@@ -300,7 +609,7 @@ export default function DashboardAdmin() {
   const handleRangeChange = async (newRange: number) => {
     setNodeRange(newRange);
     try {
-      const res = await fetch('/api/admin/set-node-range', {
+      const res = await fetch(`${API_URL}/api/admin/set-node-range`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -320,7 +629,7 @@ export default function DashboardAdmin() {
   const handleToggleNode = async (nodeId: string) => {
     setUpdatingNodeId(nodeId);
     try {
-      const res = await fetch('/api/admin/toggle-node-outage', {
+      const res = await fetch(`${API_URL}/api/admin/toggle-node-outage`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -434,17 +743,67 @@ export default function DashboardAdmin() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3 w-full md:w-auto justify-end">
+        <div className="flex flex-wrap items-center gap-3 w-full md:w-auto justify-end">
+          {/* Latency / Ping status indicator (Prompt 3) */}
+          <div className="flex items-center gap-1.5 px-2 py-1.5 bg-slate-950 border border-slate-800 rounded-lg shrink-0" style={{ maxWidth: '90px' }}>
+            {pingStatus === 'ok' && (
+              <span className="text-emerald-400 font-mono text-[11px] flex items-center gap-1 shrink-0">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                <span>{pingMs}ms</span>
+              </span>
+            )}
+            {pingStatus === 'slow' && (
+              <span className="text-yellow-400 font-mono text-[11px] flex items-center gap-1 shrink-0">
+                <span className="w-1.5 h-1.5 rounded-full bg-yellow-500" />
+                <span>{pingMs}ms</span>
+              </span>
+            )}
+            {pingStatus === 'offline' && (
+              <span className="text-red-400 font-mono text-[11px] flex items-center gap-1 shrink-0">
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                <span>Sin señal</span>
+              </span>
+            )}
+          </div>
+
+          {/* Auto Refresh Configuration (Prompt 1) */}
+          <div className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 shrink-0">
+            <div className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setAutoRefresh(!autoRefresh)}>
+              <div className={`w-8 h-4 rounded-full p-0.5 transition-colors ${autoRefresh ? 'bg-emerald-500' : 'bg-slate-800'}`}>
+                <div className={`w-3 h-3 rounded-full bg-white transition-transform ${autoRefresh ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+              <span className="text-[11px] text-slate-300 font-medium">Monitoreo Activo</span>
+            </div>
+
+            {autoRefresh && (
+              <div className="flex items-center gap-1.5 border-l border-slate-800 pl-2">
+                <span className="text-emerald-400 font-mono text-[10px] animate-pulse flex items-center gap-1 font-bold">
+                  <span className="w-1 h-1 rounded-full bg-emerald-500 animate-ping" />
+                  ● EN VIVO
+                </span>
+                <select
+                  value={refreshInterval}
+                  onChange={(e) => setRefreshInterval(Number(e.target.value))}
+                  className="bg-slate-900 border border-slate-800 rounded px-1 py-0.5 text-[10px] text-slate-300 font-mono focus:outline-none focus:border-emerald-500/50 cursor-pointer"
+                >
+                  <option value={5}>5s</option>
+                  <option value={10}>10s</option>
+                  <option value={30}>30s</option>
+                </select>
+              </div>
+            )}
+          </div>
+
           <button
             onClick={() => fetchAdminData(adminToken)}
-            className="p-2 bg-slate-950 border border-slate-800 rounded-lg hover:bg-slate-800 text-slate-300 transition-all"
+            className="p-2 bg-slate-950 border border-slate-800 rounded-lg hover:bg-slate-800 text-slate-300 transition-all cursor-pointer"
             title="Sincronizar telemetría"
           >
             <RefreshCw className="w-4 h-4" />
           </button>
           <button
             onClick={handleLogout}
-            className="px-4 py-2 bg-slate-950 hover:bg-red-950/30 border border-slate-800 hover:border-red-500/30 text-xs text-slate-400 hover:text-red-400 font-medium font-mono rounded-lg transition-all"
+            className="px-4 py-2 bg-slate-950 hover:bg-red-950/30 border border-slate-800 hover:border-red-500/30 text-xs text-slate-400 hover:text-red-400 font-medium font-mono rounded-lg transition-all cursor-pointer"
           >
             Cerrar Sesión
           </button>
@@ -550,6 +909,103 @@ export default function DashboardAdmin() {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Side: Parameters and Node Fallback list */}
         <div className="lg:col-span-4 space-y-6">
+          {/* Estado de la Red Mesh por Capas */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg space-y-4">
+            <div className="flex items-center gap-2 text-white font-medium border-b border-slate-800 pb-2">
+              <Radio className="w-4 h-4 text-emerald-500 animate-pulse" />
+              <span className="text-sm font-semibold tracking-wide">Estado de la Red Mesh por Capas</span>
+            </div>
+            
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Monitoreo activo de capas redundantes en Barquisimeto, Venezuela. El orquestador selecciona dinámicamente el canal de radio óptimo.
+            </p>
+
+            <div className="space-y-3">
+              {/* Capa 1: Internet */}
+              <div className={`p-2.5 rounded-lg border ${meshLayerStatus?.internet ? 'bg-emerald-950/20 border-emerald-500/30' : 'bg-slate-950 border-slate-800'} flex justify-between items-center`}>
+                <div className="space-y-0.5">
+                  <div className="text-xs font-semibold text-slate-200">Capa 1: WAN Internet (Cloudflare Worker)</div>
+                  <div className="text-[10px] text-slate-400 font-mono">
+                    {meshLayerStatus?.internet ? `Latencia: ${pingMs || '--'}ms` : 'Sin conexión satelital/celular'}
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
+                  meshLayerStatus?.internet ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-red-500/10 text-red-400 border border-red-500/20 animate-pulse'
+                }`}>
+                  {meshLayerStatus?.internet ? 'ONLINE' : 'OFFLINE'}
+                </span>
+              </div>
+
+              {/* Capa 2: LoRa Meshtastic */}
+              <div className={`p-2.5 rounded-lg border ${meshLayerStatus?.loRa.available ? 'bg-emerald-950/20 border-emerald-500/30' : 'bg-slate-950 border-slate-800'} flex justify-between items-center`}>
+                <div className="space-y-0.5">
+                  <div className="text-xs font-semibold text-slate-200">Capa 2: LoRa Meshtastic (Canal IAGAMI)</div>
+                  <div className="text-[10px] text-slate-400 font-mono">
+                    {meshLayerStatus?.loRa.available 
+                      ? `${meshLayerStatus.loRa.nodesNearby} nodos activos (${(meshLayerStatus.loRa.nodesNearby * 1.5).toFixed(1)} km² cobertura)` 
+                      : 'Buscando nodos de radio en 915MHz...'}
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
+                  meshLayerStatus?.loRa.available ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400 border border-slate-700'
+                }`}>
+                  {meshLayerStatus?.loRa.available ? 'ACTIVO' : 'SENSING'}
+                </span>
+              </div>
+
+              {/* Capa 3: Native BLE */}
+              <div className={`p-2.5 rounded-lg border ${meshLayerStatus?.nativeBLE.available ? 'bg-emerald-950/20 border-emerald-500/30' : 'bg-slate-950 border-slate-800'} flex justify-between items-center`}>
+                <div className="space-y-0.5">
+                  <div className="text-xs font-semibold text-slate-200">Capa 3: BLE Nativo (Brigadas de Rescate)</div>
+                  <div className="text-[10px] text-slate-400 font-mono">
+                    {meshLayerStatus?.nativeBLE.peersConnected 
+                      ? `${meshLayerStatus.nativeBLE.peersConnected} rescatistas de IAGAMI enlazados` 
+                      : 'Buscando pasarela nativa...'}
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
+                  meshLayerStatus?.nativeBLE.available ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400 border border-slate-700'
+                }`}>
+                  {meshLayerStatus?.nativeBLE.available ? 'CONECTADO' : 'SENSING'}
+                </span>
+              </div>
+
+              {/* Capa 4: Web Bluetooth */}
+              <div className={`p-2.5 rounded-lg border ${meshLayerStatus?.webBluetooth.available ? 'bg-emerald-950/20 border-emerald-500/30' : 'bg-slate-950 border-slate-800'} flex justify-between items-center`}>
+                <div className="space-y-0.5">
+                  <div className="text-xs font-semibold text-slate-200">Capa 4: Web Bluetooth PWA (Civiles Chrome)</div>
+                  <div className="text-[10px] text-slate-400 font-mono">
+                    {meshLayerStatus?.webBluetooth.peersConnected 
+                      ? `${meshLayerStatus.webBluetooth.peersConnected} pares civiles propagando alertas` 
+                      : 'Escáner inactivo'}
+                  </div>
+                </div>
+                <span className={`px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
+                  meshLayerStatus?.webBluetooth.available ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 animate-pulse' : 'bg-slate-800 text-slate-400 border border-slate-700'
+                }`}>
+                  {meshLayerStatus?.webBluetooth.available ? 'ESCANEANDO' : 'INACTIVO'}
+                </span>
+              </div>
+
+              {/* Cached Packets and Sync */}
+              <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-lg flex justify-between items-center font-mono text-[10px] text-slate-400">
+                <span>Cola local en espera:</span>
+                <span className={`font-bold ${meshLayerStatus?.cachedPackets ? 'text-amber-400' : 'text-slate-500'}`}>
+                  {meshLayerStatus?.cachedPackets || 0} paquetes
+                </span>
+              </div>
+
+              {/* Canal Óptimo Resaltado */}
+              <div className="p-3 bg-slate-950 border border-emerald-500/30 rounded-lg flex flex-col gap-1">
+                <span className="text-[10px] text-slate-400 font-mono uppercase">Canal Óptimo Seleccionado</span>
+                <div className="text-emerald-400 font-display font-black text-sm uppercase tracking-wider flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping shrink-0" />
+                  {meshLayerStatus?.optimalChannel || 'CALCULANDO...'}
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* Slider Cover Parameter */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg space-y-4">
             <div className="flex items-center gap-2 text-white font-medium border-b border-slate-800 pb-2">
@@ -579,6 +1035,107 @@ export default function DashboardAdmin() {
                 <span>500m (Crítico)</span>
               </div>
             </div>
+          </div>
+
+          {/* Formulario para agregar nodos reales */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+              <div className="flex items-center gap-2 text-white font-medium">
+                <Shield className="w-4 h-4 text-emerald-500" />
+                <span className="text-sm font-semibold tracking-wide">Agregar Nodo de Cobertura Barquisimeto</span>
+              </div>
+              <span className="px-1.5 py-0.5 bg-emerald-950 border border-emerald-800 text-emerald-400 rounded text-[9px] font-mono">
+                Director DPCAA
+              </span>
+            </div>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              setAddNodeSuccess(null);
+              setAddNodeError(null);
+              const form = e.currentTarget;
+              const formData = new FormData(form);
+              const payload = {
+                id: 'Node_' + Math.floor(1000 + Math.random() * 9000),
+                name: formData.get('name') as string,
+                lat: parseFloat(formData.get('lat') as string),
+                lng: parseFloat(formData.get('lng') as string),
+                role: formData.get('role') as string,
+                battery: parseInt(formData.get('battery') as string || '100', 10),
+                isOnline: true
+              };
+
+              if (!payload.name || isNaN(payload.lat) || isNaN(payload.lng)) {
+                setAddNodeError('Por favor complete todos los campos requeridos correctamente.');
+                return;
+              }
+
+              try {
+                const res = await fetch(`${API_URL}/api/nodes`, {
+                  method: 'POST',
+                  headers: { 
+                    'Content-Type': 'application/json',
+                    'x-admin-token': adminToken
+                  },
+                  body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) {
+                  // Refrescar lista de nodos
+                  const resNodes = await fetch(`${API_URL}/api/nodes`);
+                  const dataNodes = await resNodes.json();
+                  setNodes(dataNodes);
+                  form.reset();
+                  setAddNodeSuccess('¡Nodo agregado con éxito!');
+                } else {
+                  setAddNodeError(`Error al registrar el nodo en el servidor: ${data.error || 'Desconocido'}`);
+                }
+              } catch (err) {
+                console.error(err);
+                setAddNodeError('No se pudo conectar al servidor para registrar el nodo.');
+              }
+            }} className="space-y-3">
+              {addNodeSuccess && (
+                <div className="p-3 bg-emerald-950/40 border border-emerald-800/50 text-emerald-300 text-xs rounded-lg font-mono">
+                  {addNodeSuccess}
+                </div>
+              )}
+              {addNodeError && (
+                <div className="p-3 bg-red-950/40 border border-red-800/50 text-red-300 text-xs rounded-lg font-mono">
+                  {addNodeError}
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-400 font-semibold uppercase">Nombre del Nodo *</label>
+                  <input name="name" type="text" placeholder="Ej: Repetidor El Obelisco" className="bg-slate-950 border border-slate-800 rounded p-2 text-xs text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none" required />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-400 font-semibold uppercase">Rol de Red *</label>
+                  <select name="role" className="bg-slate-950 border border-slate-800 rounded p-2 text-xs text-white focus:border-emerald-500 focus:outline-none">
+                    <option value="gateway">Gateway (Salida Internet)</option>
+                    <option value="repeater">Repetidor (Malla)</option>
+                    <option value="brigadist">Brigadista Tactico</option>
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-400 font-semibold uppercase">Latitud GPS *</label>
+                  <input name="lat" type="number" step="any" placeholder="Ej: 10.0706" className="bg-slate-950 border border-slate-800 rounded p-2 text-xs text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none" required />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-400 font-semibold uppercase">Longitud GPS *</label>
+                  <input name="lng" type="number" step="any" placeholder="Ej: -69.3195" className="bg-slate-950 border border-slate-800 rounded p-2 text-xs text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none" required />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-400 font-semibold uppercase">Batería (%)</label>
+                  <input name="battery" type="number" min="0" max="100" placeholder="100" className="bg-slate-950 border border-slate-800 rounded p-2 text-xs text-white placeholder-slate-600 focus:border-emerald-500 focus:outline-none" />
+                </div>
+              </div>
+              <button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-2.5 rounded text-xs uppercase tracking-wider transition-all cursor-pointer active:scale-[0.98]">
+                Registrar Nodo en Producción
+              </button>
+            </form>
           </div>
 
           {/* Outage Sim Grid */}
@@ -706,7 +1263,220 @@ export default function DashboardAdmin() {
               )}
             </div>
           </div>
+
+          {/* Módulo de Auditoría y Reportes (Google Sheets) */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg space-y-4">
+            <div className="flex items-center gap-2 text-white font-medium border-b border-slate-800 pb-2">
+              <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+              <span className="text-sm font-semibold tracking-wide">Auditoría / Exportación Sheets</span>
+            </div>
+
+            {/* Offline Banner indicator */}
+            {!navigator.onLine && (
+              <div className="p-2.5 bg-amber-950/40 border border-amber-900/60 text-amber-400 text-xs rounded-lg flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 animate-bounce shrink-0" />
+                <span className="font-semibold">Exportación pendiente - Sin conexión</span>
+              </div>
+            )}
+
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Exporte y registre de manera segura la bitácora activa de emergencias <strong className="text-white">/alerts</strong> a una hoja de cálculo o descargue copias locales de seguridad.
+            </p>
+
+            <div className="space-y-3">
+              {/* Button: Conectar Google Drive (OAuth placeholder) */}
+              <button 
+                onClick={() => {
+                  window.open("https://accounts.google.com/o/oauth2/v2/auth?client_id=placeholder&redirect_uri=http://localhost:3000&response_type=token&scope=https://www.googleapis.com/auth/drive.file", "_blank");
+                  setSheetsStatus("Conexión OAuth iniciada en pestaña externa...");
+                }}
+                className="w-full flex items-center justify-center gap-3 px-4 py-2.5 bg-white hover:bg-slate-100 text-slate-800 font-medium text-xs rounded-lg border border-slate-300 shadow transition-all cursor-pointer"
+              >
+                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+                  <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                  <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                  <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l3.66-2.85z" />
+                  <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.85c.87-2.6 3.3-4.53 6.16-4.53z" />
+                </svg>
+                <span>Conectar Google Drive</span>
+              </button>
+
+              {/* Input for spreadsheet ID saved in localStorage */}
+              <div className="space-y-1.5">
+                <label className="block text-[10px] text-slate-400 font-mono uppercase">ID de Hoja de Cálculo Destino</label>
+                <input
+                  type="text"
+                  placeholder="ID guardado en localStorage..."
+                  value={spreadsheetId}
+                  onChange={(e) => {
+                    setSpreadsheetId(e.target.value);
+                    localStorage.setItem('redsos_spreadsheet_id', e.target.value);
+                  }}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 p-2 font-mono placeholder-slate-700 focus:outline-none focus:border-emerald-500/50"
+                />
+              </div>
+
+              {/* Button: Exportar Alertas a Sheets */}
+              <button
+                onClick={async () => {
+                  if (!navigator.onLine) {
+                    setSheetsError("No se puede exportar: dispositivo sin conexión de red.");
+                    return;
+                  }
+                  try {
+                    setSheetsStatus("Sincronizando con base de alertas...");
+                    const res = await fetch(`${API_URL}/api/alerts`);
+                    if (!res.ok) throw new Error("Fallo al obtener alertas");
+                    const data = await res.json();
+                    
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const blobUrl = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = blobUrl;
+                    link.download = `redsos_alerts_${Date.now()}.json`;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    URL.revokeObjectURL(blobUrl);
+
+                    setSheetsStatus("✓ Backup de alertas exportado con éxito.");
+                    setSheetsError(null);
+                  } catch (err: any) {
+                    setSheetsError(err.message || "Error al descargar alertas.");
+                  }
+                }}
+                className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-lg shadow-emerald-950/20"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Exportar Alertas a Sheets</span>
+              </button>
+            </div>
+
+            {sheetsStatus && (
+              <div className="p-2.5 bg-emerald-950/30 border border-emerald-900/40 text-emerald-400 text-[10px] rounded flex items-center gap-1.5">
+                <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>{sheetsStatus}</span>
+              </div>
+            )}
+
+            {sheetsError && (
+              <div className="p-2.5 bg-red-950/30 border border-red-900/40 text-red-400 text-[10px] rounded flex items-start gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span>{sheetsError}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Módulo de Integración con Google Chat (Notificaciones Críticas) */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg space-y-4">
+            <div className="flex items-center gap-2 text-white font-medium border-b border-slate-800 pb-2">
+              <MessageSquare className="w-4 h-4 text-sky-400" />
+              <span className="text-sm font-semibold tracking-wide">Notificaciones Google Chat</span>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Envíe de manera automática alertas críticas formatadas en <strong className="text-white">Card Format V2</strong> a un espacio de Google Chat mediante Webhook.
+            </p>
+
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <label className="block text-[10px] text-slate-400 font-mono uppercase">URL de Webhook Google Chat</label>
+                <input
+                  type="text"
+                  placeholder="https://chat.googleapis.com/v1/spaces/..."
+                  value={webhookUrl}
+                  onChange={(e) => {
+                    setWebhookUrl(e.target.value);
+                    localStorage.setItem('redsos_webhook_url', e.target.value);
+                  }}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-300 p-2 font-mono placeholder-slate-700 focus:outline-none focus:border-sky-500/50"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={handleSaveWebhook}
+                  className="py-1.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition-all cursor-pointer text-center"
+                >
+                  Guardar Enlace
+                </button>
+                <button
+                  onClick={handleTestChatNotification}
+                  disabled={isTestingChat}
+                  className="py-1.5 px-3 bg-sky-600 hover:bg-sky-700 disabled:bg-slate-850 disabled:text-slate-500 text-white text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1 shadow-md shadow-sky-950/20"
+                >
+                  {isTestingChat ? (
+                    <>
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                      <span>Probando...</span>
+                    </>
+                  ) : (
+                    <span>Probar Notificación</span>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* Circuit Breaker Status indicator */}
+            <div className="p-3 bg-slate-950 rounded-lg border border-slate-850 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-slate-400 font-mono uppercase">DevOps Circuit Breaker</span>
+                <span className={`flex items-center gap-1 text-[9px] font-mono px-2 py-0.5 rounded-full ${
+                  cbStatus?.state === 'CLOSED'
+                    ? 'bg-emerald-950/40 text-emerald-400 border border-emerald-900/60'
+                    : 'bg-red-950/40 text-red-400 border border-red-900/60 animate-pulse'
+                }`}>
+                  <span className={`w-1.5 h-1.5 rounded-full ${
+                    cbStatus?.state === 'CLOSED' ? 'bg-emerald-500' : 'bg-red-500 animate-ping'
+                  }`} />
+                  {cbStatus?.state === 'CLOSED' ? 'CLOSED' : 'OPEN'}
+                </span>
+              </div>
+
+              <div className="text-[10px] text-slate-500 space-y-1">
+                <div className="flex justify-between">
+                  <span>Mensajes en ventana (Max 3):</span>
+                  <span>{cbStatus?.requestCount || 0} / 3</span>
+                </div>
+                {cbStatus?.state === 'OPEN' && (
+                  <div className="flex justify-between text-red-400">
+                    <span>Reajuste automático en:</span>
+                    <span className="font-semibold">{cbStatus?.nextResetIn || 0}s</span>
+                  </div>
+                )}
+                {cbStatus?.suppressedCount ? cbStatus.suppressedCount > 0 && (
+                  <div className="flex justify-between text-amber-500 font-semibold">
+                    <span>Alertas suprimidas:</span>
+                    <span>{cbStatus.suppressedCount}</span>
+                  </div>
+                ) : null}
+              </div>
+
+              {cbStatus?.state === 'OPEN' && (
+                <button
+                  onClick={handleResetCircuit}
+                  className="w-full mt-2 py-1 bg-red-950/50 hover:bg-red-900/40 text-red-400 border border-red-900/40 hover:border-red-800 rounded text-[9px] font-mono transition-all cursor-pointer"
+                >
+                  Rearmar Fusible (Reset)
+                </button>
+              )}
+            </div>
+
+            {chatStatus && (
+              <div className="p-2.5 bg-sky-950/30 border border-sky-900/40 text-sky-400 text-[10px] rounded flex items-center gap-1.5">
+                <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>{chatStatus}</span>
+              </div>
+            )}
+
+            {chatError && (
+              <div className="p-2.5 bg-red-950/30 border border-red-900/40 text-red-400 text-[10px] rounded flex items-start gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                <span>{chatError}</span>
+              </div>
+            )}
+          </div>
         </div>
+
 
         {/* Right Side: Heatmap/Audit logs */}
         <div className="lg:col-span-8 space-y-6">
@@ -850,6 +1620,38 @@ export default function DashboardAdmin() {
                   )}
                 </tbody>
               </table>
+            </div>
+
+            {/* Real-time packet loss history line chart (Prompt 2) */}
+            <div className="pt-4 border-t border-slate-800/60">
+              <span className="text-[10px] text-slate-400 font-mono uppercase block mb-2">Historial de Pérdida en Tiempo Real</span>
+              {packetLossHistory.length < 2 ? (
+                <div className="flex items-center justify-center h-[180px] bg-slate-950 border border-slate-800 rounded-lg text-slate-500 text-xs font-mono">
+                  <span className="animate-pulse">Acumulando datos... ({packetLossHistory.length}/2 puntos necesarios)</span>
+                </div>
+              ) : (
+                <div className="w-full h-[180px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={packetLossHistory} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                      <XAxis dataKey="time" tick={{ fontSize: 10, fill: '#64748b' }} />
+                      <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#64748b' }} unit="%" />
+                      <Tooltip
+                        contentStyle={{ background: '#0f172a', border: '1px solid #1e293b' }}
+                        labelStyle={{ color: '#94a3b8' }}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="loss"
+                        stroke="#ef4444"
+                        strokeWidth={2}
+                        dot={false}
+                        name="Pérdida %"
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
             </div>
           </div>
 

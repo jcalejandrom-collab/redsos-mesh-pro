@@ -1,0 +1,14 @@
+name = "redsos-worker"
+main = "worker.ts"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "REDSOS_KV"
+id = "375428b08fdb4bc895c5f2f5812b7925"
+
+[vars]
+# Solo variables no sensibles aquí (las credenciales deben configurarse vía wrangler secret put)
+APP_VERSION = "1.0.0"
+MUNICIPIO_DEFAULT = "iribarren"
+MAX_ALERTS_PER_IP = "5"
+RATE_LIMIT_WINDOW_SECONDS = "60"

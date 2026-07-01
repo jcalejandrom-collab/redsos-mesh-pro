@@ -60,7 +60,14 @@ export default function BrigadePanel() {
   };
 
   return (
-    <div id="brigade-manager-panel" className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <div className="space-y-4">
+      {/* Banner de Datos de Demostración */}
+      <div className="bg-amber-950/40 border border-amber-800/60 p-3 rounded-xl flex items-center gap-2 text-amber-400 text-xs font-mono">
+        <Zap className="w-4 h-4 text-amber-400 shrink-0 animate-pulse" />
+        <span>⚠️ <strong>DATOS DE DEMOSTRACIÓN</strong> — Todos los grupos, líderes y misiones listados a continuación representan datos simulados locales, pendiente de integración con backend real.</span>
+      </div>
+
+      <div id="brigade-manager-panel" className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       
       {/* Brigade squads list column */}
       <div className="lg:col-span-2 space-y-6">
@@ -244,6 +251,7 @@ export default function BrigadePanel() {
           </p>
         </div>
       </div>
+    </div>
     </div>
   );
 }
