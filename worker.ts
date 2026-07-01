@@ -285,75 +285,9 @@ async function ensureSeedData(env: Env) {
     await env.REDSOS_KV.put("nodes", JSON.stringify(seedNodes));
   }
 
-  // 2. Seed Alerts
-  const alerts = await env.REDSOS_KV.get("alerts");
-  if (!alerts) {
-    const seedAlerts = [
-      {
-        id: "alert-1",
-        user_name: "Gael Torres",
-        latitude: 10.0650,
-        longitude: -69.3350,
-        altitude: 566,
-        accuracy: 12.4,
-        speed: 0.0,
-        battery_level: 45,
-        connection_type: "mesh_bluetooth",
-        status: "active",
-        description: "Persona atrapada en planta baja - Se requiere rescate médico",
-        audio_url: null,
-        created_at: new Date(Date.now() - 15 * 60 * 1000).toISOString()
-      },
-      {
-        id: "alert-2",
-        user_name: "Vecino de Santa Rosa",
-        latitude: 10.0710,
-        longitude: -69.2990,
-        altitude: 580,
-        accuracy: 25.0,
-        speed: 1.2,
-        battery_level: 68,
-        connection_type: "mesh_wifi",
-        status: "attending",
-        description: "Fuga de agua colapsando vía de escape principal",
-        audio_url: null,
-        created_at: new Date(Date.now() - 5 * 60 * 1000).toISOString()
-      }
-    ];
-    await env.REDSOS_KV.put("alerts", JSON.stringify(seedAlerts));
-  }
-
-  // 3. Seed Messages
-  const messages = await env.REDSOS_KV.get("messages");
-  if (!messages) {
-    const seedMessages = [
-      {
-        id: "m-1",
-        sender_name: "Estación Central El Obelisco",
-        content: "Atención a todas las brigadas, sismo reportado. Activar modo desastre.",
-        type: "text",
-        uuid: "mesh-msg-101",
-        ttl: 5,
-        hops: 0,
-        hash_sha256: "b6d8560f85822b3112c448574041b318d183fef57c0e816a7fcf27670e281bb2",
-        is_synced: true,
-        created_at: new Date(Date.now() - 25 * 60 * 1000).toISOString()
-      },
-      {
-        id: "m-2",
-        sender_name: "Brigada Cardenales (Santa Rosa)",
-        content: "Entendido, nos desplazamos hacia la Catedral para inspección de estructuras.",
-        type: "text",
-        uuid: "mesh-msg-102",
-        ttl: 4,
-        hops: 1,
-        hash_sha256: "e7cf27670e281bb2b6d8560f85822b3112c448574041b318d183fef57c0e816a",
-        is_synced: true,
-        created_at: new Date(Date.now() - 20 * 60 * 1000).toISOString()
-      }
-    ];
-    await env.REDSOS_KV.put("messages", JSON.stringify(seedMessages));
-  }
+  // NOTA: no sembramos "alerts" ni "messages" con datos falsos — un array vacío debe
+  // significar "sin alertas activas" / "sin mensajes" real, sin víctimas ni chats inventados
+  // indistinguibles de datos reales de producción.
 
   // 4. Seed Global Node Range
   const range = await env.REDSOS_KV.get("globalNodeRange");
@@ -886,17 +820,28 @@ export default {
       }
 
       // --- GET /api/admin/audit-chat (Requires Admin Auth) ---
+      // Recalcula el SHA-256 real de cada mensaje y lo compara contra el hash almacenado.
+      // No hay registro de claves públicas de firmantes en este esquema de KV, así que la
+      // verificación de firma Ed25519 no es posible server-side todavía: se reporta
+      // explícitamente como no verificable en vez de inventar un resultado.
       if (path === "/api/admin/audit-chat" && method === "GET") {
         const authErr = await checkAdminAuth();
         if (authErr) return authErr;
 
         const messages = await getKVArray<any>(env, "messages");
-        const auditedMessages = messages.map((msg) => ({
-          ...msg,
-          verifiedIntegrity: true,
-          shaHashMatched: true,
-          decryptionKeyUsed: "RSA-SECURE-GOV-2026",
-        }));
+        const auditedMessages = await Promise.all(
+          messages.map(async (msg) => {
+            const realHash = await generateRealSha256(msg.content || "");
+            const shaHashMatched = Boolean(msg.hash_sha256) && realHash === msg.hash_sha256;
+            return {
+              ...msg,
+              recalculatedHash: realHash,
+              shaHashMatched,
+              signatureVerified: msg.signature ? null : undefined, // sin registro de claves públicas server-side, no verificable
+              verifiedIntegrity: shaHashMatched,
+            };
+          })
+        );
 
         return new Response(JSON.stringify(auditedMessages), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
