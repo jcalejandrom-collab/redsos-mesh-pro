@@ -1,6 +1,6 @@
 import React from 'react';
 // @ts-ignore
-import logoImg from '../assets/images/redsos_logo_1782652668352.jpg';
+import logoImg from '../assets/images/redsos_logo_1782922520653.jpg';
 
 interface LogoProps {
   size?: 'sm' | 'md' | 'lg' | 'xl';

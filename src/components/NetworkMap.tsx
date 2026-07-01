@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { MeshNode, EmergencyAlert } from '../types';
-import { Radio, MapPin, Battery, AlertTriangle, Shield, CheckCircle2, Navigation, RefreshCw } from 'lucide-react';
+import { Radio, MapPin, Battery, AlertTriangle, Shield, CheckCircle2, Navigation, RefreshCw, X, CheckCircle, Heart, Clock } from 'lucide-react';
+import { markAsAttending, markAsResolved, haversineDistance } from '../services/ProximityService';
 
 interface NetworkMapProps {
   nodes: MeshNode[];
@@ -11,7 +12,13 @@ interface NetworkMapProps {
   selectedNodeId: string | null;
   onSelectNode: (id: string | null) => void;
   isDesastreMode: boolean;
+  userRole?: 'user' | 'brigadist' | 'operator';
+  adminToken?: string;
+  onAttendAlert?: (alertId: string) => void;
 }
+
+// Module-level cache to bridge coordinates/alert-id across React 18 StrictMode remounts
+let sessionFocusCache: { lat: number | null; lng: number | null; alertId: string | null } | null = null;
 
 export default function NetworkMap({
   nodes,
@@ -21,11 +28,20 @@ export default function NetworkMap({
   onUpdateUserCoords,
   selectedNodeId,
   onSelectNode,
-  isDesastreMode
+  isDesastreMode,
+  userRole = 'user',
+  adminToken,
+  onAttendAlert
 }: NetworkMapProps) {
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
   // Map dimensions reference
   const mapWidth = 800;
   const mapHeight = 500;
+
+  // Selected Alert Popup state
+  const [selectedAlertId, setSelectedAlertId] = useState<string | null>(null);
 
   // Center coordinate of Barquisimeto, Venezuela for our mapping projection
   const mapCenterLat = 10.0735;
@@ -55,6 +71,51 @@ export default function NetworkMap({
 
     onUpdateUserCoords(Number(lat.toFixed(6)), Number(lng.toFixed(6)));
   };
+
+  // Auto-center map to saved alert coordinates if clicked from proximity banner
+  React.useEffect(() => {
+    const savedLat = localStorage.getItem('redsos_center_lat');
+    const savedLng = localStorage.getItem('redsos_center_lng');
+    const savedAlertId = localStorage.getItem('redsos_center_alert_id');
+
+    let currentLat = savedLat ? parseFloat(savedLat) : null;
+    let currentLng = savedLng ? parseFloat(savedLng) : null;
+    let currentAlertId = savedAlertId || null;
+
+    if (currentLat !== null && currentLng !== null) {
+      onUpdateUserCoords(currentLat, currentLng);
+      // Store in session cache to survive StrictMode double-mounting
+      sessionFocusCache = {
+        lat: currentLat,
+        lng: currentLng,
+        alertId: currentAlertId || (sessionFocusCache ? sessionFocusCache.alertId : null)
+      };
+      localStorage.removeItem('redsos_center_lat');
+      localStorage.removeItem('redsos_center_lng');
+    } else if (sessionFocusCache?.lat !== null && sessionFocusCache?.lng !== null && sessionFocusCache?.lat !== undefined) {
+      onUpdateUserCoords(sessionFocusCache.lat, sessionFocusCache.lng);
+    }
+
+    if (currentAlertId) {
+      setSelectedAlertId(currentAlertId);
+      // Store in session cache to survive StrictMode double-mounting
+      sessionFocusCache = {
+        lat: currentLat !== null ? currentLat : (sessionFocusCache ? sessionFocusCache.lat : null),
+        lng: currentLng !== null ? currentLng : (sessionFocusCache ? sessionFocusCache.lng : null),
+        alertId: currentAlertId
+      };
+      localStorage.removeItem('redsos_center_alert_id');
+    } else if (sessionFocusCache?.alertId) {
+      setSelectedAlertId(sessionFocusCache.alertId);
+    }
+
+    // Clear the cache synchronously soon after mount has completed
+    const timer = setTimeout(() => {
+      sessionFocusCache = null;
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [onUpdateUserCoords]);
 
   // Get active node details for displaying in sidebar
   const selectedNode = nodes.find(n => n.id === selectedNodeId);
@@ -178,6 +239,60 @@ export default function NetworkMap({
               return null;
             })()}
 
+            {/* 1. Optimal Route Path from User to Nearest SOS Alert */}
+            {(() => {
+              const activeAlerts = alerts.filter(a => a.status !== 'resolved');
+              if (activeAlerts.length === 0) return null;
+              
+              let closestAlert: any = null;
+              let minDistance = Infinity;
+              
+              activeAlerts.forEach(a => {
+                const d = haversineDistance(userLat, userLng, parseFloat(String(a.latitude)), parseFloat(String(a.longitude)));
+                if (d < minDistance) {
+                  minDistance = d;
+                  closestAlert = a;
+                }
+              });
+              
+              if (closestAlert) {
+                const ax = scaleX(parseFloat(String(closestAlert.longitude)));
+                const ay = scaleY(parseFloat(String(closestAlert.latitude)));
+                const ux = scaleX(userLng);
+                const uy = scaleY(userLat);
+                
+                return (
+                  <g>
+                    {/* Route line */}
+                    <line
+                      x1={ux}
+                      y1={uy}
+                      x2={ax}
+                      y2={ay}
+                      stroke="#10b981"
+                      strokeWidth="3.5"
+                      strokeDasharray="5,5"
+                      className="animate-pulse"
+                      opacity="0.8"
+                    />
+                    {/* Tooltip along route */}
+                    <text
+                      x={(ux + ax) / 2}
+                      y={(uy + ay) / 2 - 8}
+                      fill="#34d399"
+                      fontSize="9"
+                      fontFamily="var(--font-mono)"
+                      textAnchor="middle"
+                      fontWeight="bold"
+                    >
+                      Ruta SOS ({Math.round(minDistance)}m)
+                    </text>
+                  </g>
+                );
+              }
+              return null;
+            })()}
+
             {/* Render Simulated Rescue Points / Safe spots */}
             <g opacity="0.8">
               {/* Hospital Node Icon */}
@@ -255,20 +370,69 @@ export default function NetworkMap({
               );
             })}
 
-            {/* Active Distress Alerts Pulsing Markers */}
+            {/* Active/Attending Distress Alerts Pulsing Markers */}
             {alerts.filter(a => a.status !== 'resolved').map(alert => {
-              const x = scaleX(alert.longitude);
-              const y = scaleY(alert.latitude);
+              const x = scaleX(parseFloat(alert.longitude as any));
+              const y = scaleY(parseFloat(alert.latitude as any));
+              const isActive = alert.status === 'active';
 
               return (
-                <g key={`map-alert-${alert.id}`} className="pointer-events-none">
+                <g 
+                  key={`map-alert-${alert.id}`} 
+                  className="cursor-pointer"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedAlertId(alert.id);
+                  }}
+                >
                   {/* Glowing warning halo */}
-                  <circle cx={x} cy={y} r="25" fill="rgba(239, 68, 68, 0.12)" stroke="#ef4444" strokeWidth="0.5" className="sos-ring" />
-                  <circle cx={x} cy={y} r="14" fill="rgba(239, 68, 68, 0.25)" stroke="#ef4444" strokeWidth="1" className="animate-ping" />
+                  <circle 
+                    cx={x} 
+                    cy={y} 
+                    r={isActive ? 25 : 20} 
+                    fill={isActive ? "rgba(239, 68, 68, 0.12)" : "rgba(245, 158, 11, 0.1)"} 
+                    stroke={isActive ? "#ef4444" : "#f59e0b"} 
+                    strokeWidth="0.5" 
+                    className="sos-ring" 
+                  />
+                  <circle 
+                    cx={x} 
+                    cy={y} 
+                    r={isActive ? 14 : 10} 
+                    fill={isActive ? "rgba(239, 68, 68, 0.25)" : "rgba(245, 158, 11, 0.2)"} 
+                    stroke={isActive ? "#ef4444" : "#f59e0b"} 
+                    strokeWidth="1" 
+                    className="animate-ping" 
+                  />
 
-                  {/* Warning pin */}
-                  <circle cx={x} cy={y} r="7" fill="#ef4444" stroke="#ffffff" strokeWidth="1.5" />
-                  <path d="M-3,-3 L3,3 M3,-3 L-3,3" stroke="#ffffff" strokeWidth="1.2" transform={`translate(${x}, ${y})`} />
+                  {/* Warning pin marker */}
+                  <circle 
+                    cx={x} 
+                    cy={y} 
+                    r="8.5" 
+                    fill={isActive ? "#ef4444" : "#f59e0b"} 
+                    stroke="#ffffff" 
+                    strokeWidth="1.5" 
+                  />
+                  {/* Symbol inside pin */}
+                  {isActive ? (
+                    <text x={x} y={y + 3} fill="#ffffff" fontSize="9" fontWeight="bold" textAnchor="middle">⚠️</text>
+                  ) : (
+                    <text x={x} y={y + 3} fill="#ffffff" fontSize="8" fontWeight="bold" textAnchor="middle">🚑</text>
+                  )}
+                  
+                  {/* Small tag */}
+                  <text 
+                    x={x} 
+                    y={y - 12} 
+                    fill={isActive ? "#fca5a5" : "#fde047"} 
+                    fontSize="8" 
+                    fontFamily="var(--font-mono)"
+                    fontWeight="bold"
+                    textAnchor="middle"
+                  >
+                    {alert.user_name?.split(' ')[0]}
+                  </text>
                 </g>
               );
             })}
@@ -279,6 +443,9 @@ export default function NetworkMap({
               transform={`translate(${scaleX(userLng)}, ${scaleY(userLat)})`}
               className="transition-all duration-300 pointer-events-none"
             >
+              {/* Proximity 500m radius circle (63 pixels represent 500m) */}
+              <circle cx="0" cy="0" r="63" fill="rgba(59, 130, 246, 0.05)" stroke="rgba(59, 130, 246, 0.3)" strokeWidth="1" strokeDasharray="3,3" />
+
               {/* Outer ring */}
               <circle cx="0" cy="0" r="16" fill="rgba(59, 130, 246, 0.2)" stroke="#3b82f6" strokeWidth="1.5" />
               <circle cx="0" cy="0" r="8" fill="#3b82f6" stroke="#ffffff" strokeWidth="2" />
@@ -289,8 +456,146 @@ export default function NetworkMap({
                 MI NODO (TÚ)
               </text>
             </g>
+
+            {/* HUD / Legend Overlay in Bottom Right Corner */}
+            <g transform={`translate(${mapWidth - 145}, ${mapHeight - 115})`} className="pointer-events-none select-none">
+              <rect width="135" height="100" rx="6" fill="rgba(15, 23, 42, 0.85)" stroke="#334155" strokeWidth="1.5" />
+              
+              <text x="12" y="18" fill="#94a3b8" fontSize="9" fontWeight="bold" fontFamily="var(--font-mono)">LEYENDA TÁCTICA</text>
+              
+              <circle cx="18" cy="35" r="5" fill="#ef4444" />
+              <text x="32" y="38" fill="#e2e8f0" fontSize="9" fontWeight="medium">🔴 SOS Activo</text>
+              
+              <circle cx="18" cy="52" r="5" fill="#f59e0b" />
+              <text x="32" y="55" fill="#e2e8f0" fontSize="9" fontWeight="medium">🟡 En Atención</text>
+              
+              <circle cx="18" cy="69" r="5" fill="#10b981" />
+              <text x="32" y="72" fill="#e2e8f0" fontSize="9" fontWeight="medium">🟢 Resuelto</text>
+              
+              <circle cx="18" cy="86" r="5" fill="#3b82f6" />
+              <text x="32" y="89" fill="#e2e8f0" fontSize="9" fontWeight="medium">🔵 Tu Posición</text>
+            </g>
           </svg>
         </div>
+
+        {/* Interactive Alert Popup Card */}
+        {(() => {
+          if (!selectedAlertId) return null;
+          const selectedAlert = alerts.find(a => a.id === selectedAlertId);
+          if (!selectedAlert) return null;
+          const isActive = selectedAlert.status === 'active';
+
+          return (
+            <div className="absolute top-16 right-4 bg-slate-950/95 border border-slate-800 p-4 rounded-xl shadow-2xl z-20 w-[280px] space-y-3 backdrop-blur text-xs">
+              <div className="flex justify-between items-start">
+                <span className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider ${
+                  isActive ? 'bg-red-950 text-red-400 border border-red-900/40 animate-pulse' : 'bg-amber-950 text-amber-400 border border-amber-900/40'
+                }`}>
+                  {isActive ? '⚠️ SOS ACTIVO' : '🚑 EN ATENCIÓN'}
+                </span>
+                <button 
+                  onClick={() => {
+                    setSelectedAlertId(null);
+                    setSuccessMessage(null);
+                    setErrorMessage(null);
+                  }} 
+                  className="text-slate-400 hover:text-slate-200 p-0.5 rounded-lg hover:bg-slate-900 transition-colors"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div>
+                <h4 className="font-bold text-slate-100">{selectedAlert.user_name || 'Afectado'}</h4>
+                <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                  Distancia: <span className="text-sky-400 font-bold">
+                    {Math.round(haversineDistance(userLat, userLng, parseFloat(String(selectedAlert.latitude)), parseFloat(String(selectedAlert.longitude))))}m
+                  </span>
+                </p>
+              </div>
+
+              <p className="text-slate-300 leading-relaxed bg-slate-900 p-2 rounded border border-slate-800 italic">
+                "{selectedAlert.description || 'Sin descripción disponible.'}"
+              </p>
+
+              <div className="flex justify-between text-[10px] text-slate-400 font-mono">
+                <span className="flex items-center gap-0.5">
+                  <Battery className="w-3.5 h-3.5 text-emerald-400" /> {selectedAlert.battery_level}% Bat
+                </span>
+                <span className="flex items-center gap-0.5">
+                  <Clock className="w-3.5 h-3.5" /> hace {Math.round(Math.max(0, (Date.now() - new Date(selectedAlert.created_at).getTime()) / 60000))} min
+                </span>
+              </div>
+
+              {/* Mensajes de feedback */}
+              {successMessage && (
+                <div className="p-2 bg-emerald-950/60 border border-emerald-900 rounded text-emerald-400 text-[10px] text-center font-mono animate-pulse">
+                  {successMessage}
+                </div>
+              )}
+              {errorMessage && (
+                <div className="p-2 bg-red-950/60 border border-red-900 rounded text-red-400 text-[10px] text-center font-mono">
+                  {errorMessage}
+                </div>
+              )}
+
+              {/* Botones de Acción */}
+              {userRole !== 'user' && (
+                <div className="pt-2 border-t border-slate-900 flex gap-2">
+                  {isActive ? (
+                    <button
+                      onClick={async () => {
+                        setSuccessMessage(null);
+                        setErrorMessage(null);
+                        try {
+                          const opName = userRole === 'operator' ? 'Operador RedSOS' : 'Brigadista RedSOS';
+                          if (onAttendAlert) {
+                            onAttendAlert(selectedAlert.id);
+                          } else {
+                            await markAsAttending(selectedAlert.id, opName, adminToken);
+                            setSuccessMessage('✓ Registrado en atención.');
+                          }
+                          setTimeout(() => setSelectedAlertId(null), 2500);
+                        } catch (err: any) {
+                          setErrorMessage(`Error: ${err.message}`);
+                        }
+                      }}
+                      className="flex-1 bg-amber-600 hover:bg-amber-500 text-[#0f0a00] font-bold py-1.5 rounded transition-colors text-[10px]"
+                    >
+                      ATENDER
+                    </button>
+                  ) : (
+                    <button
+                      onClick={async () => {
+                        setSuccessMessage(null);
+                        setErrorMessage(null);
+                        try {
+                          await markAsResolved(selectedAlert.id, adminToken);
+                          setSuccessMessage('✓ Emergencia marcada como resuelta.');
+                          setTimeout(() => setSelectedAlertId(null), 2500);
+                        } catch (err: any) {
+                          setErrorMessage(`Error: ${err.message}`);
+                        }
+                      }}
+                      className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 rounded transition-colors text-[10px]"
+                    >
+                      RESOLVER
+                    </button>
+                  )}
+                  <a
+                    href={`https://maps.google.com/?q=${selectedAlert.latitude},${selectedAlert.longitude}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold py-1.5 rounded transition-colors text-[10px] text-center"
+                  >
+                    NAVEGAR
+                  </a>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
 
         {/* Coords footer tracker */}
         <div className="absolute bottom-4 left-4 right-4 bg-slate-900/90 backdrop-blur border border-slate-700/60 p-2.5 rounded-lg flex justify-between items-center text-xs">

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { MeshNode, PacketLog } from '../types';
-import { Radio, Battery, Activity, HardDrive, Cpu, AlertTriangle, Play, RefreshCw, Trash2, Edit2, CheckCircle } from 'lucide-react';
+import { Radio, Battery, Activity, HardDrive, Cpu, AlertTriangle, Play, RefreshCw, Trash2, Edit2, CheckCircle, Zap } from 'lucide-react';
+import { triggerSimulatedSeismicEvent, clearSeismicSimulation } from '../services/MeshOrchestrator';
 
 interface SimulationPanelProps {
   nodes: MeshNode[];
@@ -25,6 +26,7 @@ export default function SimulationPanel({
 }: SimulationPanelProps) {
   // Simulated packet logs state
   const [packetLogs, setPacketLogs] = useState<PacketLog[]>([]);
+  const [seismicActive, setSeismicActive] = useState(false);
   const [activeSchemaTab, setActiveSchemaTab] = useState<'users' | 'alerts' | 'messages' | 'locations' | 'mesh_neighbors'>('alerts');
 
   // Manual Node Add/Edit Form state
@@ -189,7 +191,7 @@ export default function SimulationPanel({
             Inyección de Eventos Críticos (Simulación de Sensores)
           </h3>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             
             {/* Fall detection */}
             <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 flex flex-col justify-between">
@@ -247,6 +249,36 @@ export default function SimulationPanel({
               >
                 <AlertTriangle className="w-3.5 h-3.5" />
                 {isJammed ? 'Señal Inhibida' : 'Inhibir Canales'}
+              </button>
+            </div>
+
+            {/* Seismic Detector */}
+            <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 flex flex-col justify-between">
+              <div>
+                <h4 className="text-xs font-bold text-slate-200">Detector Sísmico</h4>
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Simula aceleración fuerte de placas tectónicas (M 7.2 SEVERO) que dispara todas las capas.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (seismicActive) {
+                    clearSeismicSimulation();
+                    setSeismicActive(false);
+                  } else {
+                    triggerSimulatedSeismicEvent('SEVERO', 7.2);
+                    setSeismicActive(true);
+                  }
+                }}
+                className={`w-full mt-4 py-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors ${
+                  seismicActive
+                    ? 'bg-red-600 hover:bg-red-500 text-white animate-pulse'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5 text-amber-400" />
+                {seismicActive ? 'Limpiar Sismo' : 'Simular Sismo'}
               </button>
             </div>
           </div>

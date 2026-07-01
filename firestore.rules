@@ -14,6 +14,11 @@ service cloud.firestore {
                     && request.resource.data.longitude <= 180.0;
       // Updates and deletes are restricted to authorized personnel / admin services
       allow update, delete: if request.auth != null;
+
+      // Allow public read/write to the helpers subcollection so civilians can see/mark themselves as helping
+      match /helpers/{helperId} {
+        allow read, write: if true;
+      }
     }
 
     match /nodes/{nodeId} {

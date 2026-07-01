@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">RedSOS — IAGAMI Venezuela</string>
+    <string name="title_activity_main">RedSOS — IAGAMI Venezuela</string>
+    <string name="package_name">ve.gob.iagami.redsos</string>
+    <string name="custom_url_scheme">ve.gob.iagami.redsos</string>
+</resources>

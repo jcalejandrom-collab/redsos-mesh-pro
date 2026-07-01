@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Shield, Key, History, Sliders, ToggleLeft, ToggleRight, Check, Eye, Trash2, Database, Wifi, Server, Cpu, CloudLightning, RefreshCw } from 'lucide-react';
+import { Shield, Key, History, Sliders, ToggleLeft, ToggleRight, Check, Eye, EyeOff, Trash2, Database, Wifi, Server, Cpu, CloudLightning, RefreshCw } from 'lucide-react';
 
 interface AuditLog {
   timestamp: string;
@@ -19,6 +19,7 @@ export default function AdvancedPanel() {
   const [batteryOptimization, setBatteryOptimization] = useState<boolean>(true);
   const [mfaEnabled, setMfaEnabled] = useState<boolean>(false);
   const [rotaryKeyTime, setRotaryKeyTime] = useState<number>(60); // minutes
+  const [showDemoKey, setShowDemoKey] = useState(false);
 
   // Active sub-tab inside configuration panel
   const [subTab, setSubTab] = useState<'protocol' | 'security' | 'forensics' | 'firebase-architecture'>('protocol');
@@ -235,16 +236,20 @@ export default function AdvancedPanel() {
               {/* AES Cryptokey generator details */}
               <div className="bg-slate-950 p-4 rounded-xl border border-slate-850">
                 <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider block mb-2">Clave de Cifrado del Sector Táctico (AES-256)</span>
+                <p className="text-[9px] text-amber-500 font-semibold mb-2">⚠️ Clave de demostración — no usada en producción (el cifrado real se genera por dispositivo en CryptoService.ts).</p>
                 <div className="flex flex-col sm:flex-row gap-2">
                   <input
-                    type="password"
+                    type={showDemoKey ? 'text' : 'password'}
                     value="d3s4str3-k3y-s3ct0r-99128374-x"
                     readOnly
                     className="flex-1 bg-slate-900 border border-slate-850 p-2 rounded text-xs font-mono text-slate-400 select-all"
                   />
-                  <button className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-4 py-2 rounded flex items-center justify-center gap-1.5">
-                    <Eye className="w-3.5 h-3.5" />
-                    Mostrar Clave
+                  <button
+                    onClick={() => setShowDemoKey(v => !v)}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-4 py-2 rounded flex items-center justify-center gap-1.5"
+                  >
+                    {showDemoKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    {showDemoKey ? 'Ocultar Clave' : 'Mostrar Clave'}
                   </button>
                 </div>
                 <p className="text-[9px] text-slate-500 mt-2">La clave se deriva automáticamente mediante KDF a partir de la firma de autenticación del operador.</p>

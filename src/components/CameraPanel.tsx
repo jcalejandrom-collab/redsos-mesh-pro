@@ -3,6 +3,12 @@ import { Camera, Video, Compass, Plane, RefreshCw, Battery, Radio, AlertCircle, 
 
 export default function CameraPanel() {
   const [activeCam, setActiveCam] = useState<string>('dron-1');
+  const [isReconnecting, setIsReconnecting] = useState(false);
+
+  const handleReconnect = () => {
+    setIsReconnecting(true);
+    setTimeout(() => setIsReconnecting(false), 1800);
+  };
 
   const cams = [
     {
@@ -100,9 +106,13 @@ export default function CameraPanel() {
               <h3 className="font-display font-black text-slate-100 text-sm">{selectedCam.name}</h3>
               <span className="text-[10px] text-slate-400 font-mono">Tipo: {selectedCam.type} | Coordenadas: {selectedCam.lat.toFixed(4)}, {selectedCam.lng.toFixed(4)}</span>
             </div>
-            <button className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors">
-              <RefreshCw className="w-3.5 h-3.5" />
-              Reconectar Canal
+            <button
+              onClick={handleReconnect}
+              disabled={isReconnecting}
+              className="bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-300 text-xs px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isReconnecting ? 'animate-spin' : ''}`} />
+              {isReconnecting ? 'Reconectando...' : 'Reconectar Canal'}
             </button>
           </div>
 

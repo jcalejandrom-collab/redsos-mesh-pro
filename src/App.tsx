@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { MeshNode, EmergencyAlert, ChatMessage } from './types';
 import NetworkMap from './components/NetworkMap';
+import OfflineMap from './components/OfflineMap';
 import PanicPanel from './components/PanicPanel';
 import ChatPanel from './components/ChatPanel';
 import BrigadePanel from './components/BrigadePanel';
@@ -11,6 +12,17 @@ import CameraPanel from './components/CameraPanel';
 import AdvancedPanel from './components/AdvancedPanel';
 import DashboardAdmin from './components/DashboardAdmin';
 import Logo from './components/Logo';
+import ProximityAlert from './components/ProximityAlert';
+import StoreForwardPanel from './components/StoreForwardPanel';
+import OnboardingBrigadista from './components/OnboardingBrigadista';
+import ProximityBanner from './components/ProximityBanner';
+import { requestNotificationPermission } from './services/ProximityAlertService';
+import { sendCriticalAlert } from './services/ChatNotificationService';
+import { startForwardQueue } from './services/StoreAndForwardService';
+import LoginScreen from './components/LoginScreen';
+import { initAuth, logout, getCurrentUser, createDirectSOSInFirestore } from './utils/firebase';
+import { API_URL, WORKER_URL } from './config';
+
 import { 
   Wifi, 
   WifiOff, 
@@ -28,12 +40,24 @@ import {
   RefreshCw,
   ShieldAlert,
   Video,
-  Sliders
+  Sliders,
+  Database,
+  Crosshair,
+  LogOut
 } from 'lucide-react';
 
+export type AuthState = 'loading' | 'unauthenticated' | 'authenticated' | 'emergency_guest';
+
 export default function App() {
+  // Global Toast Notification State
+  const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
+
+  // Authentication State
+  const [authState, setAuthState] = useState<AuthState>('loading');
+  const [authUser, setAuthUser] = useState<any>(null);
+
   // Navigation State
-  const [activeTab, setActiveTab] = useState<'map' | 'sos' | 'chat' | 'brigade' | 'incidents' | 'cameras' | 'sim' | 'advanced' | 'docs' | 'admin'>('map');
+  const [activeTab, setActiveTab] = useState<'map' | 'offlinemap' | 'sos' | 'chat' | 'brigade' | 'incidents' | 'cameras' | 'sim' | 'advanced' | 'docs' | 'admin' | 'storeforward' | 'tactical'>('sos');
 
   // Network & System Mode State
   const [connectionMode, setConnectionMode] = useState<'internet' | 'mesh' | 'partial'>('internet');
@@ -44,10 +68,65 @@ export default function App() {
   // Simulation/Incident states
   const [isJammed, setIsJammed] = useState(false);
   const [isFallDetected, setIsFallDetected] = useState(false);
+  const [userRole, setUserRole] = useState<'user' | 'brigadist' | 'operator'>('user');
 
   // User Simulation GPS
-  const [userLat, setUserLat] = useState(19.4326);
-  const [userLng, setUserLng] = useState(-99.1332);
+  const [userLat, setUserLat] = useState(10.0735);
+  const [userLng, setUserLng] = useState(-69.3250);
+
+  // User identification info
+  const [deviceId] = useState<string>(() => {
+    const existing = localStorage.getItem('redsos_device_id');
+    if (existing) return existing;
+    const newId = `Device_${Math.floor(1000 + Math.random() * 9000)}`;
+    localStorage.setItem('redsos_device_id', newId);
+    return newId;
+  });
+  const [userName, setUserName] = useState<string>(() => {
+    return localStorage.getItem('admin_username') || "Civil RedSOS";
+  });
+
+  // Observador de la sesión de autenticación
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (user, token) => {
+        setAuthUser(user);
+        setAuthState('authenticated');
+        if (user.displayName) {
+          setUserName(user.displayName);
+          localStorage.setItem('admin_username', user.displayName);
+        }
+      },
+      () => {
+        setAuthState('unauthenticated');
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Solicitar permiso de notificaciones al cargar la app por primera vez (no agresivo)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      requestNotificationPermission();
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // Sincronizar periódicamente el nombre de usuario de localStorage por si cambia en Onboarding
+  useEffect(() => {
+    const handleStorageChange = () => {
+      const stored = localStorage.getItem('admin_username');
+      if (stored && stored !== userName) {
+        setUserName(stored);
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+    const interval = setInterval(handleStorageChange, 2000);
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+      clearInterval(interval);
+    };
+  }, [userName]);
 
   // Entities loaded from Server
   const [nodes, setNodes] = useState<MeshNode[]>([]);
@@ -61,6 +140,12 @@ export default function App() {
   // Selected node for map details sidebar
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
+  // States for Brigadista Onboarding
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [isBrigadistVerified, setIsBrigadistVerified] = useState(() => {
+    return localStorage.getItem('redsos_brigadist_verified') === 'true';
+  });
+
   // Dynamic UTC Time tick
   useEffect(() => {
     const updateTime = () => {
@@ -72,18 +157,29 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // Hook for severe seismic trigger events to switch map
+  useEffect(() => {
+    (window as any).onSeismicSevereTrigger = () => {
+      setActiveTab('offlinemap');
+      setIsDesastreMode(true);
+    };
+    return () => {
+      delete (window as any).onSeismicSevereTrigger;
+    };
+  }, []);
+
   // Fetch telemetry and server state on mount & periodic intervals
   const fetchServerState = async () => {
     try {
-      const resNodes = await fetch('/api/nodes');
+      const resNodes = await fetch(`${API_URL}/api/nodes`);
       const dataNodes = await resNodes.json();
       setNodes(dataNodes);
 
-      const resAlerts = await fetch('/api/alerts');
+      const resAlerts = await fetch(`${API_URL}/api/alerts`);
       const dataAlerts = await resAlerts.json();
       setAlerts(dataAlerts);
 
-      const resMessages = await fetch('/api/messages');
+      const resMessages = await fetch(`${API_URL}/api/messages`);
       const dataMessages = await resMessages.json();
       setMessages(dataMessages);
     } catch (err) {
@@ -94,7 +190,18 @@ export default function App() {
   useEffect(() => {
     fetchServerState();
     const timer = setInterval(fetchServerState, 5000);
-    return () => clearInterval(timer);
+
+    // Iniciar cola automática de Store & Forward
+    const myId = localStorage.getItem('redsos_device_id') || `Device_${Math.floor(Math.random() * 10000)}`;
+    const stopQueue = startForwardQueue(myId, (res) => {
+      console.log("[StoreAndForward] Auto-forwarded packet via background thread:", res);
+      fetchServerState();
+    });
+
+    return () => {
+      clearInterval(timer);
+      stopQueue();
+    };
   }, []);
 
   // Handle Automatic Sincronización when internet is restored
@@ -110,7 +217,7 @@ export default function App() {
     
     for (const msg of offlineMessagesBuffer) {
       try {
-        await fetch('/api/messages', {
+        await fetch(`${API_URL}/api/messages`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -136,10 +243,38 @@ export default function App() {
 
   // Trigger Panic SOS Alert
   const handleTriggerSOS = async (payload: Partial<EmergencyAlert>) => {
+    // Generate an alert ID and details for Google Chat
+    const alertId = payload.id || `alert-temp-${Date.now()}`;
+    const chatAlert = {
+      id: alertId,
+      user_name: payload.user_name || "Tú (Mi Nodo)",
+      latitude: payload.latitude || userLat,
+      longitude: payload.longitude || userLng,
+      battery_level: payload.battery_level || currentBattery,
+      description: payload.description || "Alerta de pánico disparada",
+      priority: 'CRITICAL' as const,
+      status: payload.status || 'active'
+    };
+
+    // Attempt to notify Google Chat Space using sendCriticalAlert (failures/no-webhook handled gracefully inside)
+    const storedWebhook = localStorage.getItem('redsos_webhook_url') || '';
+    sendCriticalAlert({
+      id: alertId,
+      nodeId: payload.user_name || "Tú (Mi Nodo)",
+      description: payload.description || "Alerta de pánico disparada",
+      batteryLevel: payload.battery_level || currentBattery,
+      lat: payload.latitude || userLat,
+      lng: payload.longitude || userLng,
+      priority: 'CRITICAL',
+      timestamp: new Date().toISOString()
+    }, storedWebhook).catch(err => {
+      console.error("Google Chat Notification failed:", err);
+    });
+
     if (connectionMode === 'mesh') {
       // Offline mode: store in local state, alert user
       const tempAlert: EmergencyAlert = {
-        id: `alert-temp-${Date.now()}`,
+        id: alertId,
         user_name: payload.user_name || "Tú (Mi Nodo)",
         latitude: payload.latitude || userLat,
         longitude: payload.longitude || userLng,
@@ -151,16 +286,43 @@ export default function App() {
         created_at: new Date().toISOString()
       };
       setAlerts(prev => [tempAlert, ...prev]);
-      alert("⚠️ ALERTA SOS REGISTRADA EN COLA MESH. Su teléfono está propagando continuamente esta alerta a los nodos de rescate circundantes por Bluetooth LE.");
+      setToastMessage({
+        text: "⚠️ ALERTA SOS REGISTRADA EN COLA MESH. Su teléfono está propagando continuamente esta alerta a los nodos de rescate circundantes por Bluetooth LE.",
+        type: 'warning'
+      });
       return;
     }
 
     // Direct HTTP push when online or hybrid
     try {
-      const res = await fetch('/api/alerts', {
+      // 1. Guardar en Firestore para persistencia duradera y sincronización en tiempo real
+      await createDirectSOSInFirestore({
+        id: alertId,
+        user_name: payload.user_name || "Tú (Mi Nodo)",
+        latitude: payload.latitude || userLat,
+        longitude: payload.longitude || userLng,
+        battery_level: payload.battery_level || currentBattery,
+        connection_type: payload.connection_type || 'internet',
+        status: payload.status || 'active',
+        description: payload.description || "Alerta de pánico disparada",
+        userId: authUser?.uid || ""
+      });
+
+      // 2. Notificar al Cloudflare Worker API para disparar flujos centralizados de colas de prioridades
+      const res = await fetch(`${API_URL}/api/alerts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          ...payload,
+          id: alertId,
+          user_name: payload.user_name || "Tú (Mi Nodo)",
+          latitude: payload.latitude || userLat,
+          longitude: payload.longitude || userLng,
+          battery_level: payload.battery_level || currentBattery,
+          status: payload.status || 'active',
+          description: payload.description || "Alerta de pánico disparada",
+          userId: authUser?.uid || ""
+        })
       });
       const data = await res.json();
       if (data.success) {
@@ -198,7 +360,7 @@ export default function App() {
 
     // Push online to central server
     try {
-      const res = await fetch('/api/messages', {
+      const res = await fetch(`${API_URL}/api/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -223,7 +385,7 @@ export default function App() {
   // Simulation controls trigger updates
   const handleAddOrUpdateNode = async (payload: any) => {
     try {
-      const res = await fetch('/api/nodes', {
+      const res = await fetch(`${API_URL}/api/nodes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -239,7 +401,7 @@ export default function App() {
 
   const handleRemoveNode = async (id: string) => {
     try {
-      await fetch(`/api/nodes/${id}`, { method: 'DELETE' });
+      await fetch(`${API_URL}/api/nodes/${id}`, { method: 'DELETE' });
       fetchServerState();
     } catch (err) {
       console.error("Remove node failed", err);
@@ -271,7 +433,10 @@ export default function App() {
   const handleTriggerBatteryCritica = () => {
     setCurrentBattery(5);
     setIsDesastreMode(true);
-    alert("🔋 BATERÍA CRÍTICA AL 5%. El sistema ha activado automáticamente el Modo Desastre, maximizando los intervalos de beaconing y apagando la pantalla principal para salvar energía.");
+    setToastMessage({
+      text: "🔋 BATERÍA CRÍTICA AL 5%. El sistema ha activado automáticamente el Modo Desastre, maximizando los intervalos de beaconing y apagando la pantalla principal para salvar energía.",
+      type: 'error'
+    });
   };
 
   // Signal jamming simulation toggle
@@ -284,6 +449,41 @@ export default function App() {
     setUserLat(lat);
     setUserLng(lng);
   };
+
+  // Force 'sos' tab if emergency guest
+  useEffect(() => {
+    if (authState === 'emergency_guest') {
+      setActiveTab('sos');
+    }
+  }, [authState]);
+
+  if (authState === 'loading') {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[#090d16] text-white">
+        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-red-500 mb-4"></div>
+        <p className="font-mono text-xs tracking-widest uppercase text-slate-400">Verificando sistema RedSOS...</p>
+      </div>
+    );
+  }
+
+  if (authState === 'unauthenticated') {
+    return (
+      <LoginScreen
+        onLoginSuccess={(user, token) => {
+          setAuthUser(user);
+          setAuthState('authenticated');
+          if (user.displayName) {
+            setUserName(user.displayName);
+            localStorage.setItem('admin_username', user.displayName);
+          }
+        }}
+        onEmergencyGuest={() => {
+          setAuthState('emergency_guest');
+          setActiveTab('sos');
+        }}
+      />
+    );
+  }
 
   return (
     <div className={`min-h-screen flex flex-col font-sans transition-colors duration-300 ${
@@ -393,6 +593,41 @@ export default function App() {
               </button>
             </div>
 
+            {/* Perfil de Rol Táctico */}
+            <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800 text-[10px]">
+              <span className="text-[9px] font-bold text-slate-500 uppercase px-1.5 select-none">Rol:</span>
+              <button
+                onClick={() => setUserRole('user')}
+                className={`px-2 py-1 rounded text-[9px] font-bold uppercase transition-all ${
+                  userRole === 'user'
+                    ? 'bg-emerald-600 text-white font-black'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Civil
+              </button>
+              <button
+                onClick={() => setUserRole('brigadist')}
+                className={`px-2 py-1 rounded text-[9px] font-bold uppercase transition-all ${
+                  userRole === 'brigadist'
+                    ? 'bg-amber-600 text-[#0f0a00] font-black'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Brigada
+              </button>
+              <button
+                onClick={() => setUserRole('operator')}
+                className={`px-2 py-1 rounded text-[9px] font-bold uppercase transition-all ${
+                  userRole === 'operator'
+                    ? 'bg-indigo-600 text-white font-black'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Operador
+              </button>
+            </div>
+
             {/* Modo desastre big switch toggle */}
             <button
               onClick={() => setIsDesastreMode(!isDesastreMode)}
@@ -405,6 +640,22 @@ export default function App() {
             >
               <Power className="w-4 h-4" />
             </button>
+
+            {/* Logout button */}
+            {authState === 'authenticated' && (
+              <button
+                onClick={async () => {
+                  await logout();
+                  setAuthState('unauthenticated');
+                  setAuthUser(null);
+                }}
+                className="p-2 rounded-lg border border-red-500/20 bg-red-950/10 text-red-400 hover:bg-red-950/30 hover:text-red-300 flex items-center gap-1.5 text-xs font-semibold cursor-pointer active:scale-95 transition-transform"
+                title="Cerrar sesión"
+              >
+                <LogOut className="w-4 h-4" />
+                <span className="hidden sm:inline">Salir</span>
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -416,11 +667,43 @@ export default function App() {
         </div>
       )}
 
+      {/* Brigadista Pending Onboarding Banner */}
+      {userRole === 'brigadist' && !isBrigadistVerified && (
+        <div className="bg-amber-950 border-b border-amber-800 text-center py-3 px-4 text-xs font-sans text-amber-300 flex flex-col sm:flex-row items-center justify-center gap-2">
+          <span>⚠️ <strong>Identidad táctica no inicializada:</strong> Para poder firmar reportes de rescate SOS con criptografía Ed25519 y habilitar la detección de balizas en segundo plano, debe crear sus llaves oficiales.</span>
+          <button 
+            onClick={() => setShowOnboarding(true)}
+            className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold px-3 py-1 rounded text-[10px] uppercase tracking-wider transition-all cursor-pointer"
+          >
+            Realizar Onboarding
+          </button>
+        </div>
+      )}
+
+      {toastMessage && (
+        <div className={`border-b text-center py-3 px-4 text-xs font-mono flex items-center justify-center gap-3 transition-all ${
+          toastMessage.type === 'success' 
+            ? 'bg-emerald-950/90 border-emerald-800 text-emerald-300' 
+            : toastMessage.type === 'warning'
+            ? 'bg-amber-950/90 border-amber-800 text-amber-300 animate-pulse'
+            : 'bg-red-950/90 border-red-800 text-red-300'
+        }`}>
+          <span>{toastMessage.text}</span>
+          <button 
+            onClick={() => setToastMessage(null)}
+            className="shrink-0 bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white px-2 py-1 rounded text-[10px] uppercase font-bold border border-slate-800 transition-colors cursor-pointer"
+          >
+            Entendido
+          </button>
+        </div>
+      )}
+
       {/* Main Workspace Frame container */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
         
         {/* Workspace Tab navigation bar */}
-        <div className="flex flex-wrap border-b border-slate-800 bg-slate-950/60 p-1.5 rounded-xl gap-1">
+        {authState !== 'emergency_guest' && (
+          <div className="flex flex-wrap border-b border-slate-800 bg-slate-950/60 p-1.5 rounded-xl gap-1">
           <button
             onClick={() => setActiveTab('map')}
             className={`flex-1 min-w-[90px] flex items-center justify-center gap-1.5 py-2.5 text-[10px] font-bold rounded-lg uppercase tracking-wider transition-all ${
@@ -430,7 +713,19 @@ export default function App() {
             }`}
           >
             <Map className="w-3.5 h-3.5" />
-            <span>Mapa</span>
+            <span>Mapa SVG</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('offlinemap')}
+            className={`flex-1 min-w-[90px] flex items-center justify-center gap-1.5 py-2.5 text-[10px] font-bold rounded-lg uppercase tracking-wider transition-all ${
+              activeTab === 'offlinemap'
+                ? isDesastreMode ? 'bg-amber-600 text-[#0a0500]' : 'bg-slate-800 text-slate-100 shadow'
+                : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+            }`}
+          >
+            <Map className="w-3.5 h-3.5 text-emerald-500 animate-pulse" />
+            <span>Mapa Offline</span>
           </button>
 
           <button
@@ -530,6 +825,30 @@ export default function App() {
           </button>
 
           <button
+            onClick={() => setActiveTab('storeforward')}
+            className={`flex-1 min-w-[90px] flex items-center justify-center gap-1.5 py-2.5 text-[10px] font-bold rounded-lg uppercase tracking-wider transition-all ${
+              activeTab === 'storeforward'
+                ? isDesastreMode ? 'bg-amber-600 text-[#0a0500]' : 'bg-slate-800 text-slate-100 shadow'
+                : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+            }`}
+          >
+            <Database className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Store & Forward</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('tactical')}
+            className={`flex-1 min-w-[90px] flex items-center justify-center gap-1.5 py-2.5 text-[10px] font-bold rounded-lg uppercase tracking-wider transition-all ${
+              activeTab === 'tactical'
+                ? isDesastreMode ? 'bg-amber-600 text-[#0a0500]' : 'bg-slate-800 text-slate-100 shadow'
+                : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+            }`}
+          >
+            <Crosshair className="w-3.5 h-3.5 text-red-500" />
+            <span>Radar Táctico</span>
+          </button>
+
+          <button
             onClick={() => setActiveTab('docs')}
             className={`flex-1 min-w-[90px] flex items-center justify-center gap-1.5 py-2.5 text-[10px] font-bold rounded-lg uppercase tracking-wider transition-all ${
               activeTab === 'docs'
@@ -541,6 +860,7 @@ export default function App() {
             <span>Especificación</span>
           </button>
         </div>
+        )}
 
         {/* Tab view components mounting switcher */}
         <div className="transition-opacity duration-200">
@@ -554,6 +874,19 @@ export default function App() {
               selectedNodeId={selectedNodeId}
               onSelectNode={setSelectedNodeId}
               isDesastreMode={isDesastreMode}
+            />
+          )}
+
+          {activeTab === 'offlinemap' && (
+            <OfflineMap 
+              nodes={nodes}
+              alerts={alerts}
+              userLat={userLat}
+              userLng={userLng}
+              onNodeClick={(nodeId) => {
+                setSelectedNodeId(nodeId);
+                setActiveTab('map');
+              }}
             />
           )}
 
@@ -613,8 +946,44 @@ export default function App() {
           {activeTab === 'docs' && (
             <DocPanel />
           )}
+
+          {activeTab === 'storeforward' && (
+            <StoreForwardPanel userLat={userLat} userLng={userLng} />
+          )}
+
+          {activeTab === 'tactical' && (
+            <ProximityAlert userLat={userLat} userLng={userLng} userRole={userRole} inlineLayout={true} />
+          )}
         </div>
       </main>
+
+      {/* Global Floating Proximity Warning for Civilians */}
+      <ProximityBanner
+        userLat={userLat}
+        userLng={userLng}
+        userId={deviceId}
+        userName={userName}
+        onSelectTab={setActiveTab}
+      />
+
+      {activeTab !== 'tactical' && (
+        <ProximityAlert userLat={userLat} userLng={userLng} userRole={userRole} />
+      )}
+
+      {/* Onboarding Brigadista Modal Overlay */}
+      {showOnboarding && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm overflow-y-auto">
+          <div className="w-full max-w-2xl my-8">
+            <OnboardingBrigadista 
+              onComplete={(data) => {
+                setIsBrigadistVerified(true);
+                setShowOnboarding(false);
+              }}
+              onCancel={() => setShowOnboarding(false)}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Visual footer details */}
       <footer className={`p-4 mt-auto text-center border-t text-[10px] ${
